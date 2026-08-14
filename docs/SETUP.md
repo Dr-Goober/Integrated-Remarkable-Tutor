@@ -59,6 +59,12 @@ Host remarkable-usb
 
 > **After every firmware update:** redo the `authorized_keys` line and the WLAN marker file. The update wipes both; nothing else breaks.
 
+**Optional but recommended — raise the SSH connection cap.** Dropbear on the tablet is socket-activated with MaxConnections=64, and orphaned sessions (from sleep/wake cycles) count against it; when full, the tablet accepts TCP but never answers ("banner exchange timeout" while demonstrably awake). The watcher holds one persistent connection precisely to avoid this, but the belt-and-braces fix:
+```bash
+ssh remarkable 'for s in dropbear-wlan dropbear-usb0 dropbear-usb1; do mkdir -p /etc/systemd/system/$s.socket.d; printf "[Socket]\nMaxConnections=256\n" > /etc/systemd/system/$s.socket.d/rm-tutor-cap.conf; done; systemctl daemon-reload'
+```
+(Also wiped by firmware updates. If the tablet ever shows this symptom anyway, a reboot clears the wedged connections.)
+
 ## 4 · PC side — 3 min
 
 ```powershell
