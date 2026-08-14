@@ -31,7 +31,7 @@ When the user says "mark my page" / "look at my screen": run `capture.ps1` (Powe
 
 - Start: the launcher bat, or `py -3.13 rm_feedback.py`. Flags: `--once`, `--dry-run`, `--reset` (baseline, skip pre-existing ink), `--test-page DOC/PAGE.rm`, `--model`, `--effort`.
 - The 5 s poll is one `stat` over SSH and never calls a model; triggers are colour-detected from stroke files and deduped by stroke hash. Erase-and-redraw re-fires; a circle left on the page stays silent.
-- Sessions are per-workbook (mark and explain share one conversation; switching workbook starts fresh). Grey `deep explain` routes blue circles to a max-effort full-corpus agent; grey `restart` redeploys code changes.
+- Sessions are per-workbook (mark and explain share one conversation; switching workbook starts fresh). Grey `deep explain` routes blue circles to a max-effort full-corpus agent; grey `tutor` lifts the explain channel's circled-region and length limits so blue handwriting is answered as a genuine tutor question over the whole study tree; grey `screenshot q12 [paper]` fetches a question's image from its source exam PDF via `question_locations.json`; grey `restart` redeploys code changes.
 - Troubleshooting order: tablet awake? → `ssh remarkable "echo ok"` (firmware updates wipe the key AND the WLAN marker) → check `rm_feedback.log` (every decision is logged) → failed model calls stay pending and auto-retry, so fix auth (`claude` sign-in) and wait one poll.
 
 ## Physics of the loop worth knowing

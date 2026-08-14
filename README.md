@@ -4,7 +4,7 @@ Turn a reMarkable tablet into a handwriting-first AI study loop:
 
 - **Circle your handwritten work in RED** → it gets marked, strictly, against a real mark scheme, on your phone within ~30 s
 - **Circle anything in BLUE** → it gets explained differently than your notes explain it; blue *handwriting* is read as your question and answered directly
-- **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `status`, `restart`
+- **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `tutor` (blue becomes a free-form question to a full tutor), `screenshot q12` (fetches that question's image from the source exam PDF), `status`, `restart`, `help`
 - You keep writing on paper-like e-ink the whole time. No app switching, no typing, no chat window.
 
 Built during a real two-exam sprint (and battle-tested on it). Everything here is the generalised version of that setup.
