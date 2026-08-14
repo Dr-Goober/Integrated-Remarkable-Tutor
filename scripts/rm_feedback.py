@@ -26,15 +26,20 @@ Design notes
 * The tablet is treated as READ-ONLY. Nothing is ever written to it.
 """
 import argparse
+import base64
+import glob
 import hashlib
 import io
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import uuid
 
 import logging
 
@@ -67,6 +72,12 @@ LOG_PATH = os.path.join(HERE, "rm_feedback.log")
 
 POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 300          # proof-of-life, instead of a line per stroke
+OFFLINE_ALERT_AFTER = 4          # consecutive failed polls before phoning it in
+SETTLE_POLLS = 2                 # a changed page must sit unchanged this many
+                                 # polls (~10 s of pen-up) before its ink is
+                                 # acted on - xochitl commits mid-thought at any
+                                 # decent pause, and answering a half-written
+                                 # question is worse than answering 10 s later
 CLAUDE_TIMEOUT = 300
 
 # rM stores annotations as page pixels at the panel's 226 DPI, x centred on the
@@ -96,7 +107,7 @@ EFFORTS_OK = ("low", "medium", "high", "xhigh", "max")
 
 # DEEP explain: grey "deep explain" toggles it on; while on, every BLUE circle
 # is handled by a fresh standalone Fable agent at max effort with Read/Grep/Glob
-# over the full converted corpus - for when Isaac is stuck on something complex
+# over the full converted corpus - for when the student is stuck on something complex
 # and wants perspective, not speed. Slow and expensive by design.
 DEEP_MODEL, DEEP_EFFORT = "fable", "max"
 DEEP_TIMEOUT = 1200
@@ -113,7 +124,6 @@ INK_RGB = {"BLACK": (15, 15, 15), "GRAY": (130, 130, 130), "WHITE": (255, 255, 2
            "GREEN": (40, 155, 60)}
 
 # EXAMPLE MAP - REPLACE WITH YOUR OWN MODULES.
-# tablet document name -> (workbook pdf, marking-notes md), both relative to RM_STUDY_ROOT
 WORKBOOKS = {
     "AIPS-workbook-1": ("AIPS/workbooks/AIPS-workbook-day01-weeks1-3.pdf",
                         "AIPS/workbooks/tutor-day01-weeks1-3.md"),
@@ -171,33 +181,129 @@ def log(msg):
         pass
 
 
-_host = None
+class SshChannel:
+    """ONE persistent SSH connection for the whole session.
+
+    The failsafe this exists for: dropbear on the tablet is socket-activated
+    with a small concurrent-connection cap (~64). Opening a fresh connection
+    every 5-second poll - as the first version did, 720/hour - slowly fills
+    that cap with wedged half-dead sessions (every sleep/wake leaves one), and
+    once full the tablet accepts TCP but never answers: 'banner exchange
+    timeout' while the tablet is demonstrably awake. One long-lived channel
+    makes the whole class of failure impossible, and drops per-poll latency
+    from ~300 ms to ~30 ms as a bonus.
+
+    Commands run through a remote `sh` via stdin; output is framed by a random
+    end marker carrying the exit status. ServerAliveInterval in ~/.ssh/config
+    kills the channel within ~45 s of a dead link, and ensure() then reopens
+    it - wifi first, USB fallback - on the next use.
+    """
+
+    def __init__(self):
+        self.p = None
+        self.q = None
+        self.host = None
+
+    def _reader(self, p, q):
+        for raw in p.stdout:                           # binary pipe
+            q.put(raw.decode("utf-8", "replace").rstrip("\r\n"))
+        q.put(None)                                    # EOF sentinel
+
+    def _send(self, text):
+        # binary write: text=True would translate \n -> \r\n on Windows, and the
+        # stray \r glues onto the last shell token ("file not found: foo\r")
+        self.p.stdin.write(text.encode("utf-8"))
+        self.p.stdin.flush()
+
+    def close(self):
+        if self.p:
+            try:
+                self.p.kill()
+            except Exception:
+                pass
+        self.p = None
+        self.host = None
+
+    def ensure(self):
+        if self.p and self.p.poll() is None:
+            return True
+        self.close()
+        for h in (SSH_HOST, SSH_FALLBACK):
+            try:
+                p = subprocess.Popen(
+                    ["ssh", "-T", "-o", "ConnectTimeout=4", h, "sh"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL)     # binary pipes, deliberately
+            except Exception:
+                continue
+            q = queue.Queue()
+            threading.Thread(target=self._reader, args=(p, q), daemon=True).start()
+            try:
+                p.stdin.write(b"echo __READY__\n")
+                p.stdin.flush()
+                deadline = time.time() + 8
+                while True:
+                    line = q.get(timeout=max(0.1, deadline - time.time()))
+                    if line is None:
+                        raise RuntimeError("eof")
+                    if "__READY__" in line:
+                        break
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                continue
+            self.p, self.q, self.host = p, q, h
+            log("ssh channel open via %s" % h)
+            return True
+        return False
+
+    def run(self, cmd, timeout=30):
+        if not self.ensure():
+            raise RuntimeError("tablet unreachable on %s or %s"
+                               % (SSH_HOST, SSH_FALLBACK))
+        mark = "__DONE_%s__" % uuid.uuid4().hex[:10]
+        try:
+            # leading \n before the marker: commands like hexdump emit no final
+            # newline, and the marker must never merge onto an output line
+            self._send('%s\nprintf \'\\n%s %%s\\n\' "$?"\n' % (cmd, mark))
+        except Exception:
+            self.close()
+            raise RuntimeError("ssh channel write failed")
+        out = []
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.q.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                self.close()
+                raise RuntimeError("ssh channel timeout running: %s" % cmd[:60])
+            if line is None:
+                self.close()
+                raise RuntimeError("ssh channel closed by tablet")
+            if line.startswith(mark):
+                status = line[len(mark):].strip()
+                if status not in ("", "0"):
+                    raise RuntimeError("remote command failed (%s): %s"
+                                       % (status, cmd[:60]))
+                return "\n".join(out)
+            out.append(line)
+
+
+_channel = SshChannel()
 
 
 def ssh_host():
-    """Pick whichever interface answers, preferring wifi so he can roam."""
-    global _host
-    if _host:
-        return _host
-    for h in (SSH_HOST, SSH_FALLBACK):
-        try:
-            r = subprocess.run(["ssh", "-o", "ConnectTimeout=4", h, "echo ok"],
-                               capture_output=True, text=True, timeout=15)
-            if r.returncode == 0 and "ok" in r.stdout:
-                _host = h
-                log("ssh host: %s" % h)
-                return h
-        except Exception:
-            pass
-    raise RuntimeError("tablet unreachable on %s or %s" % (SSH_HOST, SSH_FALLBACK))
+    """The interface the live channel uses (needed for scp fallback)."""
+    if not _channel.ensure():
+        raise RuntimeError("tablet unreachable on %s or %s"
+                           % (SSH_HOST, SSH_FALLBACK))
+    return _channel.host
 
 
 def ssh(cmd, timeout=30):
-    r = subprocess.run(["ssh", ssh_host(), cmd],
-                       capture_output=True, text=True, timeout=timeout)
-    if r.returncode != 0:
-        raise RuntimeError("ssh failed: %s" % (r.stderr.strip()[:200],))
-    return r.stdout
+    return _channel.run(cmd, timeout)
 
 
 def load_state():
@@ -227,7 +333,23 @@ def poll_mtimes():
     return res
 
 
+HEXDUMP_FMT = "hexdump -ve " + chr(39) + "1/1 " + chr(34) + "%%02x" + chr(34) + chr(39)
+
+
 def pull(rel, dest):
+    """Fetch a file over the persistent channel so page pulls don't open new
+    connections either. The tablet's BusyBox has no base64, but hexdump
+    round-trips verified (md5-identical). scp remains as a fallback."""
+    try:
+        out = _channel.run((HEXDUMP_FMT + " '%s/%s'") % (XOCHITL, rel), timeout=60)
+        data = bytes.fromhex("".join(out.split()))
+        if not data:
+            raise RuntimeError("empty transfer")
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return dest
+    except Exception as e:
+        log("     channel pull failed (%s) - falling back to scp" % str(e)[:60])
     r = subprocess.run(["scp", "-q", "%s:%s/%s" % (ssh_host(), XOCHITL, rel), dest],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -371,7 +493,7 @@ def append_memory(module, note, wb, pageno):
         return                                    # already recorded verbatim
     lines.append(line)
     lines = lines[-MEM_MAX_LINES:]
-    header = ("# Tutor memory - %s\n\nWhat Isaac keeps getting right and wrong, "
+    header = ("# Tutor memory - %s\n\nWhat the student keeps getting right and wrong, "
               "accumulated across sessions. Newest last.\n\n" % module)
     with io.open(mem_path(module), "w", encoding="utf-8") as fh:
         fh.write(header + "\n".join(lines) + "\n")
@@ -456,6 +578,228 @@ def brief_excerpt(brief_path, ptext, limit=14000):
     if len(text) > limit:
         text = text[:limit] + "\n...[truncated]"
     return text
+
+
+# Where each module's question-bearing PDFs live (relative to STUDY), and which
+# filenames count as papers. Deliberately excludes textbooks and lecture decks.
+QUESTION_DIRS = {"AIPS": ["AIPS/Practice_Questions"], "VICO": ["VICO/pdf"]}
+SRC_NAME_RE = re.compile(r"exam|quiz|formative|paper|question", re.I)
+
+
+def _q_markers(page, q):
+    """y-coordinates where question `q` plausibly starts on this page. Handles
+    'Question 12' headings, the Blackboard-export style (left-margin number
+    followed by ESSAY / MULTIPLE CHOICE / FILL IN THE BLANK), and numbered
+    list items ('3.' at the left margin, the formative sheets' style)."""
+    tops = [r.y0 for r in (page.search_for("Question %d" % q) or [])]
+    words = page.get_text("words")
+    for i, w in enumerate(words):
+        if w[0] >= 120:
+            continue
+        if w[4] == str(q) and i + 1 < len(words) and \
+                words[i + 1][4].upper() in ("ESSAY", "MULTIPLE", "FILL"):
+            tops.append(w[1])
+        elif w[4] == "%d." % q:
+            tops.append(w[1])
+        # "Ques&on 3" - the ti ligature breaks in several practice sheets, so
+        # search_for("Question 3") misses them entirely
+        elif re.match(r"Ques.{0,3}on$", w[4]) and i + 1 < len(words) \
+                and words[i + 1][4] == str(q):
+            tops.append(w[1])
+        # "3 (25 marks)" - the VICO exam rebuilds head their QUESTIONS section
+        # this way; the word "Question" only appears in the ANSWERS section,
+        # which is exactly the wrong half to fetch from
+        elif w[4] == str(q) and i + 2 < len(words) \
+                and re.match(r"\(\d+$", words[i + 1][4]) \
+                and words[i + 2][4].startswith("mark"):
+            tops.append(w[1])
+    return sorted(tops)
+
+
+# Explicit question-location table: the authority for where each question's PNG
+# comes from. Consulted BEFORE any marker-scanning; scan results are written back
+# so the table grows with use. Hand-edit the JSON to correct a bad location;
+# QUESTION-LOOKUP.md is a generated human-readable view (build_question_map.py).
+QMAP_PATH = os.path.join(HERE, "question_locations.json")
+_qmap = None
+
+
+def qmap():
+    global _qmap
+    if _qmap is None:
+        try:
+            _qmap = json.load(io.open(QMAP_PATH, encoding="utf-8"))
+        except Exception:
+            _qmap = {}
+    return _qmap
+
+
+def qmap_save():
+    if _qmap is not None:
+        with io.open(QMAP_PATH, "w", encoding="utf-8") as fh:
+            json.dump(_qmap, fh, indent=1, sort_keys=True)
+
+
+def _locate(doc, q):
+    """Scan a document for question q. -> (page, y0, last_page, y1|None) or None,
+    all 0-based pages, y in pt. y1 is None when q+1 was never found (question may
+    run to the end of last_page)."""
+    for p in range(doc.page_count):
+        tops = _q_markers(doc[p], q)
+        if not tops:
+            continue
+        y0 = max(0.0, tops[0] - 10)
+        last, end_y = p, None
+        for p2 in range(p, min(p + 3, doc.page_count)):
+            nxt = [t for t in _q_markers(doc[p2], q + 1)
+                   if p2 > p or t > tops[0] + 20]
+            if nxt:
+                last, end_y = p2, nxt[0] - 6
+                break
+        else:
+            # no q+1 marker found (last question, or a marker-style gap):
+            # include one continuation page so multi-page tails arrive whole
+            last = min(p + 1, doc.page_count - 1)
+        return p, y0, last, end_y
+    return None
+
+
+def _render_span(doc, q, p, y0, last, end_y):
+    shots = []
+    for pi in range(p, last + 1):
+        pg = doc[pi]
+        top = y0 if pi == p else 0.0
+        bot = end_y if (pi == last and end_y is not None) else pg.rect.height
+        clip = pymupdf.Rect(0, top, pg.rect.width, max(bot, top + 60))
+        out = os.path.join(WORK_DIR, "q%d_part%d.png" % (q, pi - p + 1))
+        pg.get_pixmap(matrix=pymupdf.Matrix(3.5, 3.5), clip=clip).save(out)
+        shots.append(out)
+    return shots
+
+
+def find_question(module, q, hint=None):
+    """Locate Question q in the module's source papers and render it.
+    -> (shots, description) or None. The lookup table wins; scanning is the
+    fallback, and successful scans are persisted into the table."""
+    cands = []
+    for rel in QUESTION_DIRS.get(module, []):
+        d = os.path.join(STUDY, rel.replace("/", os.sep))
+        for f in sorted(glob.glob(os.path.join(d, "*.pdf"))):
+            if SRC_NAME_RE.search(os.path.basename(f)):
+                cands.append(f)
+    if hint:
+        toks = hint.lower().split()
+        hinted = [f for f in cands
+                  if all(tk in os.path.basename(f).lower() for tk in toks)]
+        cands = hinted or cands            # a hint that matches nothing is ignored
+    # Default preference: example paper, then questions-only papers, then
+    # with-answers rebuilds, and the real-sitting export (Isaac's wrong answers
+    # embedded) or cohort feedback only if named by hint or nothing else matches.
+    def rank(f):
+        n = os.path.basename(f).lower()
+        if "example" in n:
+            return 0
+        if "question" in n and "answer" not in n:
+            return 1
+        if "real-sitting" in n or "feedback" in n:
+            return 4
+        return 2 if "exam" in n else 3
+    # within a rank, newest paper first (filenames carry years)
+    cands.sort(key=lambda f: os.path.basename(f).lower(), reverse=True)
+    cands.sort(key=rank)
+
+    for f in cands:
+        rel = os.path.relpath(f, STUDY).replace(os.sep, "/")
+        entry = qmap().setdefault(module, {}).setdefault(rel, {})
+        loc = entry.get(str(q))
+        try:
+            doc = pymupdf.open(f)
+        except Exception:
+            continue
+        src = "table"
+        if loc:
+            p, y0 = loc["page"] - 1, loc["y0"]
+            last, end_y = loc["end_page"] - 1, loc.get("y1")
+        else:
+            found = _locate(doc, q)
+            if not found:
+                doc.close()
+                continue
+            p, y0, last, end_y = found
+            entry[str(q)] = {"page": p + 1, "y0": round(y0, 1),
+                             "end_page": last + 1,
+                             "y1": (round(end_y, 1) if end_y is not None else None)}
+            qmap_save()
+            src = "scan, saved to table"
+        shots = _render_span(doc, q, p, y0, last, end_y)
+        name, pno = os.path.basename(f), p + 1
+        doc.close()
+        desc = "Question %d from %s, page %d [%s]" % (q, name, pno, src)
+        if last > p and end_y is not None:
+            desc += " (spans %d pages - sent every part)" % (last - p + 1)
+        elif last > p:
+            desc += " (sent the following page too in case it continues)"
+        if re.search(r"answer", name, re.I):
+            desc += (". (Source file also contains model answers in a later "
+                     "section - the crop is from the questions half; tell me "
+                     "if any answer text leaks in.)")
+        return shots, desc
+    return None
+
+
+Q_REF_RE = re.compile(r"\bQ(?:uestion)?\s*\.?\s*(\d{1,2})\b", re.I)
+
+
+def guess_question(pdf_path, page_idx, bbox=None):
+    """Which exam question does this workbook page refer to? Look in the text
+    near the grey ink first, then the whole page. Lets 'screenshot from the exam
+    paper' work without a number when the page itself names the question."""
+    try:
+        doc = pymupdf.open(pdf_path)
+        page = doc[page_idx]
+        pw, ph = page.rect.width, page.rect.height
+        s = ph / RM_DOC_HEIGHT
+        texts = []
+        if bbox:
+            x0, y0, x1, y1 = bbox
+            pad = 150 * s
+            r = pymupdf.Rect(max(0, s * x0 + pw / 2 - pad), max(0, s * y0 - pad),
+                             min(pw, s * x1 + pw / 2 + pad), min(ph, s * y1 + pad))
+            texts.append(page.get_textbox(r) or "")
+        texts.append(page.get_text() or "")
+        doc.close()
+        for t in texts:
+            m = Q_REF_RE.search(t)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def page_shot(pdf_path, page_idx, bbox=None):
+    """Clean high-res renders of the source page - the PDF's own pixels, no ink.
+    For when the tablet mangles a question's display. Returns [region?, full],
+    region first so the thing he asked about is the primary attachment."""
+    doc = pymupdf.open(pdf_path)
+    page = doc[page_idx]
+    pw, ph = page.rect.width, page.rect.height
+    s = ph / RM_DOC_HEIGHT
+    shots = []
+    if bbox:
+        x0, y0, x1, y1 = bbox
+        # taller than a written word = he circled a region, so crop to it
+        if (y1 - y0) > 180:
+            r = pymupdf.Rect(max(0, s * x0 + pw / 2 - 15), max(0, s * y0 - 15),
+                             min(pw, s * x1 + pw / 2 + 15), min(ph, s * y1 + 15))
+            p = os.path.join(WORK_DIR, "shot_p%d_region.png" % (page_idx + 1))
+            page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=r).save(p)
+            shots.append(p)
+    p = os.path.join(WORK_DIR, "shot_p%d_page.png" % (page_idx + 1))
+    page.get_pixmap(matrix=pymupdf.Matrix(3, 3)).save(p)
+    shots.append(p)
+    doc.close()
+    return shots
 
 
 # --------------------------------------------------------------------------- #
@@ -717,8 +1061,24 @@ def classify(text):
         return "set-effort", ("high", scope)
     if re.search(r"\bthink less\b|\bless thinking\b|\bfaster\b|\bquicker\b", t):
         return "set-effort", ("low", scope)
+    if re.search(r"\bhelp\b|\bcommands?\b|\bwhat can you do\b", t):
+        return "help", None
     if re.search(r"\brestart\b|\breboot\b|\breload\b", t):
         return "restart", None
+    if re.search(r"\bscreen ?shot\b|\bpng\b|\bphoto\b|\bpicture\b|\bsnap\b"
+                 r"|\bsend\b.*\b(page|question)\b", t):
+        # "screenshot q12 example exam" -> fetch Question 12 from a source paper.
+        # Bare "screenshot" -> render the circled region of the current page.
+        mq = re.search(r"\bq(?:uestion)?\s*\.?\s*(\d{1,2})\b", t)
+        stop = {"screenshot", "screen", "shot", "png", "photo", "picture", "snap",
+                "image", "send", "me", "a", "of", "the", "from", "question", "q",
+                "please", "crop", "this", "it", "that", "and", "for", "paper",
+                "pdf", "page", "in", "on"}
+        toks = [w for w in re.findall(r"[a-z0-9-]+", t)
+                if w not in stop and not w.isdigit()
+                and not re.fullmatch(r"q\d+", w)]
+        return "screenshot", ((int(mq.group(1)) if mq else None),
+                              (" ".join(toks) or None))
     if re.search(r"\bdeep\b", t):
         off = bool(re.search(r"\boff\b|\bdisable\b|\bstop\b|\bnormal\b", t))
         return "deep", ("off" if off else "on")
@@ -731,9 +1091,41 @@ def classify(text):
     return "unknown", text.strip()
 
 
-def handle_command(crop_png, state, dry=False):
+HELP_TEXT = u"""GREY INK COMMANDS (write any of these in grey)
+
+INK COLOURS
+red circle = mark the circled work, strictly
+blue circle = explain it; blue handwriting = your question
+grey = commands (this list). Erase circles once answered.
+
+FETCH A QUESTION IMAGE
+'screenshot q12' - Question 12 from the default paper
+'screenshot q1 real' / 'q3 game theory' / 'q1 formative' - name the paper
+'screenshot from the exam paper' - infers the question from the page you're on
+'screenshot' alone + a grey circle - renders the circled region of THIS page
+(sources and exact pages: workbooks/QUESTION-LOOKUP.md)
+
+MODELS AND EFFORT
+'model opus' / 'model sonnet' / 'model haiku' - both mark and explain
+'mark haiku' / 'explain opus' - scope to one task
+'effort high' / 'think harder' / 'faster' - reasoning effort
+'which model?' - report current setup
+
+DEEP MODE
+'deep explain' - blue circles go to a max-effort Fable agent that reads the
+whole corpus (several minutes each). 'deep off' - back to quick explains.
+
+SYSTEM
+'status' - models, deep on/off, requests answered, active workbook
+'restart' - relaunch the watcher with the latest code
+'help' - this list"""
+
+
+def handle_command(crop_png, state, dry=False, page=None):
     """Grey ink is a control channel, not a question. Always read with the
-    fastest model so switching away from a slow one is itself quick."""
+    fastest model so switching away from a slow one is itself quick.
+    `page` = (pdf_path, page_idx, grey_bbox) so screenshot requests can render
+    from the source PDF. Screenshots are handed back via state["_shots"]."""
     if dry:
         log("DRY-RUN command read of %s" % crop_png)
         return "(dry run)", "cmd"
@@ -775,6 +1167,49 @@ def handle_command(crop_png, state, dry=False):
                    len(state.get("answered", [])),
                    len(state.get("mtimes", {})),
                    state.get("active_wb") or "none")), "status"
+    if kind == "help":
+        return HELP_TEXT, "command list"
+    if kind == "screenshot":
+        q, hint = arg if isinstance(arg, tuple) else (None, None)
+        inferred = False
+        # The gesture decides what a bare "screenshot" means: a proper circled
+        # REGION (taller than a written word) means "render what I circled from
+        # this page"; just the written word means "fetch the exam question this
+        # page is about". Extra words like "from the exam paper" force a fetch.
+        region_gesture = bool(page and page[2] and
+                              (page[2][3] - page[2][1]) > 180)
+        if not q and page and (hint or not region_gesture):
+            q = guess_question(page[0], page[1], page[2])
+            inferred = q is not None
+        if q:
+            module = (page or (None, None, None, "AIPS"))[3]
+            found = find_question(module, q, hint)
+            if found:
+                state["_shots"], desc = found
+                pre = ("The page you're on references Question %d, so I fetched "
+                       "that. If you meant a different one, write the number: "
+                       "'screenshot q3'.\n\n" % q) if inferred else ""
+                return (pre + "%s - rendered straight from the paper." % desc), \
+                       "Q%d fetched" % q
+            names = []
+            for rel in QUESTION_DIRS.get(module, []):
+                d = os.path.join(STUDY, rel.replace("/", os.sep))
+                names += [os.path.basename(f)[:44] for f in
+                          sorted(glob.glob(os.path.join(d, "*.pdf")))
+                          if SRC_NAME_RE.search(os.path.basename(f))]
+            return ("Could not find a 'Question %d' marker%s. Searched:\n%s\n"
+                    "Name the paper in the command (e.g. 'screenshot q%d formative') "
+                    "or check the question number."
+                    % (q, (" matching '%s'" % hint) if hint else "",
+                       "\n".join("- " + n for n in names[:10]), q)), "Q%d not found" % q
+        if not page:
+            return "No page context - circle on a workbook page.", "screenshot failed"
+        shots = page_shot(page[0], page[1], page[2])
+        state["_shots"] = shots
+        return ("Sent %d render%s of the current page from its source PDF. To fetch "
+                "a question from an exam paper instead, write e.g. 'screenshot q12' "
+                "or 'screenshot q3 game theory quiz'."
+                % (len(shots), "" if len(shots) == 1 else "s")), "page screenshot"
     if kind == "restart":
         # actual respawn happens in the main loop AFTER this trigger is recorded
         # as answered and state is saved - otherwise the new process re-fires on
@@ -793,9 +1228,9 @@ def handle_command(crop_png, state, dry=False):
         state["deep"] = False
         return ("DEEP explain off - blue circles back to %s/%s quick explains."
                 % profile(state, "explain")), "DEEP explain off"
-    return ("Read that as: \"%s\"\nNot a command I know. Try: 'model haiku' / "
-            "'model sonnet' / 'model opus', 'which model?', or 'status'."
-            % (said[:120] or "nothing legible")), "unknown command"
+    return ("Read that as: \"%s\" - not a command I know.\n"
+            "Write 'help' in grey for the full command list."
+            % (said[:120] or "nothing legible")), "unknown - write 'help' in grey"
 
 
 def notify(title, body, image=None, priority="default", tags=None, dry=False):
@@ -870,14 +1305,20 @@ def handle(rel, state, dry=False):
         # grey = control channel; no marking, no brief, always the fast model
         if g["kind"] == "command":
             try:
-                body, short = handle_command(crop_png or full_png, state, dry=dry)
+                body, short = handle_command(crop_png or full_png, state, dry=dry,
+                                             page=(pdf_path, idx, g["bbox"], module))
             except Exception as e:
                 log("  !! command failed: %s" % e)
                 notify("CMD ERROR", str(e)[:400], priority="high",
                        tags="warning", dry=dry)
                 failed += 1
                 continue
-            notify("CMD - %s" % short, body, tags="gear", dry=dry)
+            shots = state.pop("_shots", [])       # transient - never persisted
+            notify("CMD - %s" % short, body, tags="gear", dry=dry,
+                   image=(shots[0] if shots else None))
+            for extra in shots[1:]:
+                notify("CMD - %s" % short, "full page for context",
+                       image=extra, dry=dry)
             state["answered"].append(g["hash"])
             done += 1
             continue
@@ -992,16 +1433,44 @@ def main():
     if first_pass:
         log("no previous state - baselining, will not fire on existing ink")
     last_beat, seen_changes = time.time(), 0
+    offline_polls = 0
+    settling = {}                 # rel -> [mtime, stable_poll_count]
 
     while True:
         try:
             now = poll_mtimes()
+            if offline_polls >= OFFLINE_ALERT_AFTER:
+                log("tablet back online after %d failed polls" % offline_polls)
+                try:
+                    notify("Tablet reconnected", "Back online - catching up now.",
+                           priority="low", tags="zzz", dry=args.dry_run)
+                except Exception:
+                    pass
+            offline_polls = 0
+            # Settle gate: only act on a page once its mtime has held still for
+            # SETTLE_POLLS consecutive polls - i.e. Isaac has stopped writing.
+            # Without this, a pause at a line break commits half a question and
+            # we would answer it mid-sentence.
+            changed = []
+            if first_pass:
+                settling.clear()               # baseline, never fire on old ink
+            else:
+                for r, mt in now.items():
+                    if state["mtimes"].get(r) == mt:
+                        settling.pop(r, None)
+                        continue
+                    s = settling.get(r)
+                    if s and s[0] == mt:
+                        s[1] += 1
+                        if s[1] >= SETTLE_POLLS:
+                            changed.append(r)
+                            del settling[r]
+                    else:
+                        settling[r] = [mt, 0]  # fresh ink - start the clock
             # Oldest write first, so circling page 11 then page 12 answers in
             # that order. Filesystem glob order is by UUID, which would deliver
             # them in an arbitrary sequence.
-            changed = sorted((r for r, mt in now.items()
-                              if state["mtimes"].get(r) != mt),
-                             key=lambda r: now[r])
+            changed.sort(key=lambda r: now[r])
             pending = set()
             if first_pass:
                 log("baselined %d pages" % len(now))
@@ -1023,6 +1492,10 @@ def main():
             state["mtimes"] = now
             # anything that failed stays "unseen" so the next poll retries it
             for rel in pending:
+                state["mtimes"].pop(rel, None)
+            # pages still settling must also stay "unseen", or this assignment
+            # would mark them handled and their ink would never fire
+            for rel in settling:
                 state["mtimes"].pop(rel, None)
             if pending:
                 log("%d page(s) pending retry" % len(pending))
@@ -1051,8 +1524,18 @@ def main():
             return
         except Exception as e:
             log("poll error: %s" % e)
-            global _host
-            _host = None          # force interface re-probe (tablet may have slept)
+            _channel.close()      # force a clean reopen (wifi first, then USB)
+            offline_polls += 1
+            # tell the PHONE, once - the console is not where he is looking
+            if offline_polls == OFFLINE_ALERT_AFTER:
+                try:
+                    notify("Tablet unreachable - asleep?",
+                           "Lost the connection to the reMarkable (usually sleep). "
+                           "Tap it awake and I'll catch up - circles drawn in the "
+                           "meantime are not lost.",
+                           priority="high", tags="zzz", dry=args.dry_run)
+                except Exception:
+                    pass
         if args.once:
             return
         try:
@@ -1064,6 +1547,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
