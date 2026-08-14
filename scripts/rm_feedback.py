@@ -862,6 +862,24 @@ TASKS = {
                 "check question."),
 }
 
+# Grey "tutor" swaps the explain task for this. The standard rules still arrive
+# with every prompt, so the override has to name which of them stop applying -
+# otherwise the 200-word cap and the circled-work-only rule quietly win.
+TUTOR_TASK = u"""FULL-TUTOR MODE. This is a question to his personal tutor, and the following
+overrides the standard rules where they conflict:
+- The blue handwriting is the question; the circle only anchors where he is.
+  The question may be about ANYTHING - this module, exam strategy, his past
+  performance - so answer the question actually asked, not the circled drill.
+- You have Read, Grep and Glob over the whole study tree. Start from:
+    {module_root}\\md\\   converted study materials, if present
+    the workbook PDFs and marking-notes files named in the WORKBOOKS map
+  Go and read what the question needs; never answer a question about his own
+  past work without opening the file that holds it.
+- The 200-word cap is lifted: up to 600 words when the question deserves it.
+- Everything else stands: strict standards, exam discipline, say it differently
+  from the workbook, end with one check question, and the first line is still
+  "VERDICT: <max 8 words>"."""
+
 DEEP_PROMPT = u"""You are Isaac's deep-dive tutor for the {module} module (exam {exam},
 open book for AIPS, closed book for VICO). He has enabled DEEP explain because he is
 STRUGGLING with something complex and wants as much perspective as possible. Take your
@@ -1012,7 +1030,11 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
     else:
         tpl, why = FOLLOWUP_NEW_PAGE, "resume, new page"
 
-    prompt = tpl.format(task=TASKS[ctx["kind"]], **ctx)
+    task = TASKS[ctx["kind"]]
+    if ctx["kind"] == "explain" and state.get("tutor"):
+        task = TUTOR_TASK.format(module_root=os.path.join(STUDY, ctx["module"]))
+        why += ", full-tutor"
+    prompt = tpl.format(task=task, **ctx)
     log("     %s | prompt %d chars (excerpt %d)" % (why, len(prompt), len(ctx["excerpt"])))
     if dry:
         log("DRY-RUN prompt:\n" + prompt[:2000])
@@ -1025,7 +1047,7 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
             log("     resume failed, starting a fresh conversation")
             state["sessions"].pop(wb_key, None)
             args, _ = session_args(state, wb_key)
-            prompt = PROMPT.format(task=TASKS[ctx["kind"]], **ctx)
+            prompt = PROMPT.format(task=task, **ctx)
             out = run_claude(prompt, model, effort, tools="Read Grep Glob", extra=args)
         else:
             raise
@@ -1086,6 +1108,9 @@ def classify(text):
     if re.search(r"\bdeep\b", t):
         off = bool(re.search(r"\boff\b|\bdisable\b|\bstop\b|\bnormal\b", t))
         return "deep", ("off" if off else "on")
+    if re.search(r"\btutor\w*\b", t):
+        off = bool(re.search(r"\boff\b|\bdisable\b|\bstop\b|\bnormal\b|\bquick\b", t))
+        return "tutor", ("off" if off else "on")
     if re.search(r"\beffort\b|\bthinking\b", t):
         return "get-model", None          # asking about effort -> report both
     if re.search(r"\bmodel\b|\bmodle\b", t):
@@ -1118,6 +1143,12 @@ MODELS AND EFFORT
 DEEP MODE
 'deep explain' - blue circles go to a max-effort Fable agent that reads the
 whole corpus (several minutes each). 'deep off' - back to quick explains.
+
+FULL TUTOR
+'tutor' - blue handwriting becomes a question to your tutor: it reads
+anything in the study tree and answers at length - not limited to the
+circled work. Stays in the same conversation, so follow-ups build on it.
+'tutor off' - quick explains.
 
 SYSTEM
 'status' - models, deep on/off, requests answered, active workbook
@@ -1165,9 +1196,10 @@ def handle_command(crop_png, state, dry=False, page=None):
         return (describe() + "\n\nIn grey: 'model opus', 'explain opus', "
                 "'mark sonnet', 'effort high', 'think harder', 'faster'."), describe()
     if kind == "status":
-        return ("%s\nDEEP explain: %s. %d requests answered. Watching %d pages. "
-                "Active workbook: %s."
+        return ("%s\nDEEP explain: %s. Full tutor: %s. %d requests answered. "
+                "Watching %d pages. Active workbook: %s."
                 % (describe(), "ON" if state.get("deep") else "off",
+                   "ON" if state.get("tutor") else "off",
                    len(state.get("answered", [])),
                    len(state.get("mtimes", {})),
                    state.get("active_wb") or "none")), "status"
@@ -1232,6 +1264,19 @@ def handle_command(crop_png, state, dry=False, page=None):
         state["deep"] = False
         return ("DEEP explain off - blue circles back to %s/%s quick explains."
                 % profile(state, "explain")), "DEEP explain off"
+    if kind == "tutor":
+        if arg == "on":
+            state["tutor"] = True
+            return ("FULL TUTOR enabled (%s/%s). Blue handwriting is now a question "
+                    "to your tutor: it reads whatever the question needs from the "
+                    "study tree and answers at length instead of only explaining "
+                    "the circled work. Red marking is unchanged. 'tutor off' "
+                    "returns to quick explains. (While 'deep explain' is on, it "
+                    "still takes precedence for blue circles.)"
+                    % profile(state, "explain")), "FULL TUTOR on"
+        state["tutor"] = False
+        return ("Full tutor off - blue circles back to quick, focused explains "
+                "of the circled work."), "full tutor off"
     return ("Read that as: \"%s\" - not a command I know.\n"
             "Write 'help' in grey for the full command list."
             % (said[:120] or "nothing legible")), "unknown - write 'help' in grey"
