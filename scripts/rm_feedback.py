@@ -941,6 +941,10 @@ def run_claude(prompt, model, effort=EFFORT_DEFAULT, tools="Read Grep",
     # argv passes through cmd.exe and hits the 8191-char Windows command-line
     # limit - which anything with an inlined brief excerpt comfortably exceeds.
     cmd = [claude_exe(), "-p", "--model", model, "--effort", effort]
+    # Headless agents may only read below their cwd (here: scripts\). Grant the
+    # whole study tree, or any "look at file X" request gets a file-access
+    # denial - the tools are read-only, so this is safe.
+    cmd += ["--add-dir", STUDY]
     if tools:
         cmd += ["--allowedTools", tools]
     if extra:
@@ -1014,7 +1018,7 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
         log("DRY-RUN prompt:\n" + prompt[:2000])
         return "VERDICT: dry run\n(no model called)"
     try:
-        out = run_claude(prompt, model, effort, tools="Read", extra=args)
+        out = run_claude(prompt, model, effort, tools="Read Grep Glob", extra=args)
     except RuntimeError as e:
         # a resume can fail if the transcript was cleaned up - start over once
         if not is_new and "resume" in (" ".join(args) + str(e)).lower():
@@ -1022,7 +1026,7 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
             state["sessions"].pop(wb_key, None)
             args, _ = session_args(state, wb_key)
             prompt = PROMPT.format(task=TASKS[ctx["kind"]], **ctx)
-            out = run_claude(prompt, model, effort, tools="Read", extra=args)
+            out = run_claude(prompt, model, effort, tools="Read Grep Glob", extra=args)
         else:
             raise
     state["last_page"] = (wb_key, ctx["pageno"])
