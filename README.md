@@ -35,8 +35,8 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
 ## Prerequisites
 
 - **reMarkable 2** (rM1 likely works; Paper Pro untested) with SSH enabled — see `docs/SETUP.md`
-- **Windows PC** on the same network (the watcher is Windows-flavoured; the SSH/parsing core is portable)
-- **Python 3.10+** with `rmscene`, `pymupdf`, `pillow` (`pip install rmscene pymupdf pillow`)
+- **A computer on the same network** — Windows, Linux, or macOS (launchers for each are included; away from home, tablet and computer can share a phone hotspot and the watcher finds the tablet by itself)
+- **Python 3.10+** — `pip install -r requirements.txt` (rmscene, pymupdf, pillow)
 - **Claude Code CLI** installed and signed in (`npm i -g @anthropic-ai/claude-code`, then `claude` once to authenticate)
 - **ntfy** app on your phone (free, iOS/Android) subscribed to a topic you choose
 
@@ -48,7 +48,7 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
    - `RM_STUDY_ROOT` — the folder holding your module folders.
 3. Edit the `WORKBOOKS` map in `rm_feedback.py`: tablet document name → (source PDF, tutor brief). The shipped map is the author's — replace it.
 4. Put the PDFs you study from on the tablet with the **same names** as in the map.
-5. Double-click `START-WATCHER.bat`. Write, circle, keep working.
+5. Double-click `START-WATCHER.bat` (Windows) or run `sh START-WATCHER.sh` (Linux/macOS). Write, circle, keep working.
 
 ## The four hard-won technical facts (so you don't rediscover them)
 
@@ -64,7 +64,7 @@ Marking one circled answer ≈ 20–40k tokens (page image + the relevant slice 
 ## Failure modes to expect
 
 - **Firmware updates wipe `~/.ssh/authorized_keys` AND the WLAN-SSH marker file.** If the watcher can't connect after an update, redo those two steps from `docs/SETUP.md`. Nothing else will have broken.
-- The tablet sleeps → SSH drops → the watcher re-probes (wifi, then USB at `10.11.99.1`) on the next poll. Failed model calls stay queued and retry; nothing is lost.
+- The tablet sleeps → SSH drops → the watcher re-probes on the next poll (wifi, USB at `10.11.99.1`, then a phone-hotspot subnet scan). Failed model calls stay queued and retry; nothing is lost.
 - Marks on borderline answers vary between runs. The *substance* of the feedback is stable; treat the number as indicative and mark real mocks against your own answer key.
 
 ## Legal note
