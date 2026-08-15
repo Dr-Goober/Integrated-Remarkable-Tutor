@@ -79,4 +79,6 @@ Finally, edit the `WORKBOOKS` map at the top of `scripts/rm_feedback.py`: for ea
 
 ## Daily use
 
-Double-click `START-WATCHER.bat`. Circle in red to get marked, blue to get explained, grey for commands. Erase circles once answered. Turn the page after circling — it forces the tablet to flush the stroke file, which is what fires the trigger. Ctrl-C or close the window when done.
+Double-click `START-WATCHER.bat` (Windows) or run `sh START-WATCHER.sh` (Linux/macOS). Circle in red to get marked, blue to get explained, grey for commands. Erase circles once answered. Turn the page after circling — it forces the tablet to flush the stroke file, which is what fires the trigger. Ctrl-C or close the window when done.
+
+**Out and about:** put the tablet and the computer on the same phone hotspot and start the watcher as normal. When the configured ssh aliases don't answer, it scans the hotspot subnet by itself (iPhone's range and the USB address are built in; `export RM_HOTSPOT_NET="192.168.43."` before launching adds an Android-style range). Notifications still arrive over the phone's own connection. Two rules: if your study folder lives in a synced drive, keep the sync client running; and never run two watchers against the same folder at once — they share a state file.

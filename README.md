@@ -25,6 +25,7 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
 | `scripts/capture.ps1` | Manual fallback: screenshots the reMarkable desktop app (works even when occluded) for ad-hoc "mark my screen" requests. |
 | `scripts/extract_lectures.py` | PDF→markdown converter for lecture decks, with the four extraction traps already solved (see below). |
 | `scripts/START-WATCHER.bat` | Double-click launcher (also makes grey `restart` work cleanly). |
+| `scripts/START-WATCHER.sh` | The same launcher for Linux/macOS (`sh START-WATCHER.sh`). |
 | `docs/SETUP.md` | One-time setup: tablet SSH, keys, phone notifications, Python. |
 | `docs/BUILD-YOUR-MODULE.md` | The full pipeline: raw module PDFs → study corpus → plan → write-on workbooks → tutor briefs. |
 | `skills/` | The workflow packaged as Claude Code skills — drop into `.claude/skills/` and the agent runs the pipeline for you. |

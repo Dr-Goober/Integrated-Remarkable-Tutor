@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or `sh` chokes on the stray \r
+# when the repo is cloned on Windows and copied to a Linux machine.
+*.sh text eol=lf
+*.bat text eol=crlf
