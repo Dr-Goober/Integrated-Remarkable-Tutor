@@ -59,6 +59,15 @@ logging.getLogger("rmscene").setLevel(logging.ERROR)
 # --------------------------------------------------------------------------- #
 SSH_HOST = "remarkable"          # falls back to remarkable-usb automatically
 SSH_FALLBACK = "remarkable-usb"
+SSH_KEY = os.path.expanduser("~/.ssh/remarkable")
+# On-the-fly fallback: when neither ssh-config alias answers (out and about,
+# tablet + laptop on a phone hotspot), scan the tiny subnets phones hand out
+# and key-auth anything with port 22 open that proves it is the tablet.
+# iPhone Personal Hotspot leases 172.20.10.2-14; 10.11.99.1 is the USB cable.
+# RM_HOTSPOT_NET="192.168.43." (env var) adds an Android-style /24 if needed.
+HOTSPOT_NETS = [("172.20.10.", 2, 15), ("10.11.99.", 1, 2)]
+if os.environ.get("RM_HOTSPOT_NET"):
+    HOTSPOT_NETS.append((os.environ["RM_HOTSPOT_NET"], 2, 255))
 XOCHITL = "/home/root/.local/share/remarkable/xochitl"
 
 NTFY_TOPIC = os.environ.get("RM_NTFY_TOPIC", "CHANGE-ME-long-random-string")
@@ -203,6 +212,7 @@ class SshChannel:
         self.p = None
         self.q = None
         self.host = None
+        self.host_args = []          # extra ssh/scp args for discovered hosts
 
     def _reader(self, p, q):
         for raw in p.stdout:                           # binary pipe
@@ -224,44 +234,62 @@ class SshChannel:
         self.p = None
         self.host = None
 
+    def _try_open(self, h, extra):
+        """Open one candidate; a discovered host must also prove it IS the
+        tablet (has the xochitl store) before we accept it - a hotspot scan
+        can hit any device that happens to run sshd."""
+        try:
+            p = subprocess.Popen(
+                ["ssh", "-T", "-o", "ConnectTimeout=4", "-o", "BatchMode=yes"]
+                + extra + [h, "sh"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)     # binary pipes, deliberately
+        except Exception:
+            return False
+        q = queue.Queue()
+        threading.Thread(target=self._reader, args=(p, q), daemon=True).start()
+        try:
+            probe = b"echo __READY__\n"
+            if extra:
+                probe = ("test -d '%s' && echo __READY__ || echo __NOTRM__\n"
+                         % XOCHITL).encode()
+            p.stdin.write(probe)
+            p.stdin.flush()
+            deadline = time.time() + 8
+            while True:
+                line = q.get(timeout=max(0.1, deadline - time.time()))
+                if line is None or "__NOTRM__" in line:
+                    raise RuntimeError("not the tablet")
+                if "__READY__" in line:
+                    break
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return False
+        self.p, self.q, self.host, self.host_args = p, q, h, extra
+        log("ssh channel open via %s" % h)
+        return True
+
     def ensure(self):
         if self.p and self.p.poll() is None:
             return True
         self.close()
         for h in (SSH_HOST, SSH_FALLBACK):
-            try:
-                p = subprocess.Popen(
-                    ["ssh", "-T", "-o", "ConnectTimeout=4", h, "sh"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL)     # binary pipes, deliberately
-            except Exception:
-                continue
-            q = queue.Queue()
-            threading.Thread(target=self._reader, args=(p, q), daemon=True).start()
-            try:
-                p.stdin.write(b"echo __READY__\n")
-                p.stdin.flush()
-                deadline = time.time() + 8
-                while True:
-                    line = q.get(timeout=max(0.1, deadline - time.time()))
-                    if line is None:
-                        raise RuntimeError("eof")
-                    if "__READY__" in line:
-                        break
-            except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                continue
-            self.p, self.q, self.host = p, q, h
-            log("ssh channel open via %s" % h)
-            return True
+            if self._try_open(h, []):
+                return True
+        # both aliases dead: maybe we're on a phone hotspot where the tablet
+        # has an IP the ssh config has never heard of - go and find it
+        extra = _key_args()
+        for h in discover_tablet():
+            if self._try_open(h, extra):
+                return True
         return False
 
     def run(self, cmd, timeout=30):
         if not self.ensure():
-            raise RuntimeError("tablet unreachable on %s or %s"
+            raise RuntimeError("tablet unreachable on %s, %s or hotspot scan"
                                % (SSH_HOST, SSH_FALLBACK))
         mark = "__DONE_%s__" % uuid.uuid4().hex[:10]
         try:
@@ -291,13 +319,52 @@ class SshChannel:
             out.append(line)
 
 
+def _key_args():
+    """ssh/scp args for hosts not in ~/.ssh/config (hotspot-discovered IPs)."""
+    args = ["-o", "StrictHostKeyChecking=accept-new"]
+    if os.path.exists(SSH_KEY):
+        args = ["-i", SSH_KEY, "-o", "IdentitiesOnly=yes"] + args
+    return args
+
+
+def discover_tablet():
+    """Scan the hotspot-sized subnets in HOTSPOT_NETS for anything with port
+    22 open. Cheap (a handful of parallel half-second probes) and only runs
+    once both ssh-config aliases have already failed."""
+    import socket
+    open_ips, lock, threads = [], threading.Lock(), []
+
+    def probe(ip):
+        s = socket.socket()
+        s.settimeout(0.6)
+        try:
+            s.connect((ip, 22))
+            with lock:
+                open_ips.append(ip)
+        except Exception:
+            pass
+        finally:
+            s.close()
+
+    for base, lo, hi in HOTSPOT_NETS:
+        for n in range(lo, hi):
+            t = threading.Thread(target=probe, args=(base + str(n),), daemon=True)
+            t.start()
+            threads.append(t)
+    for t in threads:
+        t.join()
+    if open_ips:
+        log("hotspot scan: ssh open on %s" % ", ".join(sorted(open_ips)))
+    return ["root@" + ip for ip in sorted(open_ips)]
+
+
 _channel = SshChannel()
 
 
 def ssh_host():
     """The interface the live channel uses (needed for scp fallback)."""
     if not _channel.ensure():
-        raise RuntimeError("tablet unreachable on %s or %s"
+        raise RuntimeError("tablet unreachable on %s, %s or hotspot scan"
                            % (SSH_HOST, SSH_FALLBACK))
     return _channel.host
 
@@ -350,7 +417,8 @@ def pull(rel, dest):
         return dest
     except Exception as e:
         log("     channel pull failed (%s) - falling back to scp" % str(e)[:60])
-    r = subprocess.run(["scp", "-q", "%s:%s/%s" % (ssh_host(), XOCHITL, rel), dest],
+    r = subprocess.run(["scp", "-q"] + _channel.host_args
+                       + ["%s:%s/%s" % (ssh_host(), XOCHITL, rel), dest],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError("scp failed: %s" % r.stderr.strip()[:200])
