@@ -1,5 +1,7 @@
 # Integrated reMarkable Tutor
 
+A Python watcher connects to a reMarkable 2 over SSH and monitors its stroke files for ink in trigger colours: circle handwritten work in **red** to have it marked, **blue** to have it explained, or write a command in **grey**, and the matching Claude agent spins up, reads your page grounded in your own study materials, and pushes its reply to your phone via ntfy. You never leave the page — the phone is just a notification display. This repository holds everything needed to rebuild the workflow: the watcher and helper scripts, one-time setup instructions, and the Claude skill files that turn raw course PDFs into a study corpus, write-on workbooks, and the tutor briefs the marking is grounded in.
+
 Turn a reMarkable tablet into a handwriting-first AI study loop:
 
 - **Circle your handwritten work in RED** → it gets marked, strictly, against a real mark scheme, on your phone within ~30 s
