@@ -939,7 +939,7 @@ overrides the standard rules where they conflict:
   The question may be about ANYTHING - this module, exam strategy, his past
   performance - so answer the question actually asked, not the circled drill.
 - You have Read, Grep and Glob over the whole study tree. Start from:
-    {module_root}\\md\\   converted study materials, if present
+    {module_root}/md/   converted study materials, if present
     the workbook PDFs and marking-notes files named in the WORKBOOKS map
   Go and read what the question needs; never answer a question about his own
   past work without opening the file that holds it.
@@ -965,9 +965,9 @@ The image shows what he circled in blue (blue handwriting = his own question): {
 --- END ---
 
 RESEARCH FIRST - you have Read, Grep and Glob. The converted corpus:
-  {module_root}\\md\\lectures\\week-*\\        the lecturer's own slides, one .md per lecture
-  {module_root}\\md\\practice\\                every practice paper and answer set
-  {module_root}\\workbooks\\tutor-*.md         drill answers and marking logic
+  {module_root}/md/lectures/week-*/        the lecturer's own slides, one .md per lecture
+  {module_root}/md/practice/               every practice paper and answer set
+  {module_root}/workbooks/tutor-*.md       drill answers and marking logic
 Chase the circled concept through it: the lecture that introduces it, every worked
 example of it anywhere, every past-paper appearance, and what the marking logic
 actually rewards. Read what you find, not just the excerpt above.
