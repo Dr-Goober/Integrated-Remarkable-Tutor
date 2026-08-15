@@ -68,7 +68,7 @@ ssh remarkable 'for s in dropbear-wlan dropbear-usb0 dropbear-usb1; do mkdir -p 
 ## 4 · PC side — 3 min
 
 ```powershell
-pip install rmscene pymupdf pillow
+pip install -r requirements.txt    # rmscene, pymupdf, pillow
 npm install -g @anthropic-ai/claude-code
 claude          # sign in once; the watcher shells out to `claude -p`
 setx RM_STUDY_ROOT "C:\path\to\your\Study"

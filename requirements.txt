@@ -1,0 +1,3 @@
+rmscene>=0.8      # .rm v6 stroke parser (needs Python 3.10+)
+pymupdf>=1.24     # PDF rendering and text extraction
+pillow>=10.0      # page image composition
