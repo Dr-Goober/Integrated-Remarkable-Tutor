@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Phase 3 - convert AIPS lecture PDFs to markdown with figures pulled out as PNGs.
+"""Convert lecture-deck PDFs to markdown with figures pulled out as PNGs.
+
+Usage: python extract_lectures.py <pdf-dir> <output-dir>   (defaults: lectures md/lectures)
 
 Extraction notes (why this is not just get_text()):
   * Beamer decks repeat a navigation sidebar on EVERY slide. Lines appearing on

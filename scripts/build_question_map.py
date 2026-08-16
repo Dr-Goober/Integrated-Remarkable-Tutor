@@ -89,7 +89,7 @@ def build():
             hint = os.path.basename(rel).split(".")[0]
             md.append(u"| Q%s | %s | %s | `screenshot q%s %s` |"
                       % (qs, start, end, qs,
-                         "" if "example" in hint or module == "VICO" else hint[:24]))
+                         "" if "example" in hint else hint[:24]))
         md.append(u"")
     out = os.path.join(HERE, "QUESTION-LOOKUP.md")
     with io.open(out, "w", encoding="utf-8") as fh:

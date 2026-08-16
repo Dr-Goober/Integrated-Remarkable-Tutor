@@ -132,41 +132,30 @@ INK_RGB = {"BLACK": (15, 15, 15), "GRAY": (130, 130, 130), "WHITE": (255, 255, 2
            "RED": (205, 25, 25), "BLUE": (25, 55, 205), "YELLOW": (235, 195, 40),
            "GREEN": (40, 155, 60)}
 
-# EXAMPLE MAP - REPLACE WITH YOUR OWN MODULES.
+# EXAMPLE MAP - REPLACE WITH YOUR OWN MODULES. Keys are document names as they
+# appear on the tablet; values are (source PDF, marking-notes markdown), both
+# relative to RM_STUDY_ROOT. The FIRST PATH SEGMENT of the source PDF is taken
+# as the module name - it groups conversations, tutor memory, exam dates and
+# question lookups, so keep one folder per module.
 WORKBOOKS = {
-    "AIPS-workbook-1": ("AIPS/workbooks/AIPS-workbook-day01-weeks1-3.pdf",
-                        "AIPS/workbooks/tutor-day01-weeks1-3.md"),
-    "AIPS-workbook-2": ("AIPS/workbooks/AIPS-workbook-days2-3-weeks4-5.pdf",
-                        "AIPS/workbooks/tutor-days2-3-weeks4-5.md"),
-    "AIPS-workbook-3": ("AIPS/workbooks/AIPS-workbook-days4-6-cp-modelling.pdf",
-                        "AIPS/workbooks/tutor-days4-6-cp-modelling.md"),
-    "AIPS-workbook-4": ("AIPS/workbooks/AIPS-workbook-days7-9-cp-solving-1.pdf",
-                        "AIPS/workbooks/tutor-days7-9-cp-solving-1.md"),
-    "AIPS-workbook-5": ("AIPS/workbooks/AIPS-workbook-days10-12-ac4-and-mock.pdf",
-                        "AIPS/workbooks/tutor-days10-12-ac4-and-mock.md"),
-    "VICO-workbook-1": ("VICO/workbooks/VICO-workbook-days2-3.pdf",
-                        "VICO/workbooks/tutor-days2-3.md"),
-    "VICO-workbook-2": ("VICO/workbooks/VICO-workbook-days4-6.pdf",
-                        "VICO/workbooks/tutor-days4-6.md"),
-    "VICO-workbook-3": ("VICO/workbooks/VICO-workbook-days7-9.pdf",
-                        "VICO/workbooks/tutor-days7-9.md"),
-    "VICO-workbook-4": ("VICO/workbooks/VICO-workbook-days10-12.pdf",
-                        "VICO/workbooks/tutor-days10-12.md"),
-    "VICO-workbook-5": ("VICO/workbooks/VICO-workbook-days13-16.pdf",
-                        "VICO/workbooks/tutor-days13-16.md"),
+    "MODULE-A-workbook-1": ("MODULE-A/workbooks/workbook-1.pdf",
+                            "MODULE-A/workbooks/marking-notes-1.md"),
+    "MODULE-B-workbook-1": ("MODULE-B/workbooks/workbook-1.pdf",
+                            "MODULE-B/workbooks/marking-notes-1.md"),
+}
+
+# Exam date (and any format notes) per module, quoted to the tutor for context.
+# Optional - modules missing from here just get no exam line.
+EXAM_DATES = {
+    "MODULE-A": "Mon 1 Jun 2026, closed book",
+    "MODULE-B": "Tue 2 Jun 2026, open book",
 }
 
 
 # Documents are named inconsistently on the tablet - some carry the ".pdf"
-# extension, some don't, and older copies use the original long filenames.
-ALIASES = {
-    "VICO-workbook-days2-3": "VICO-workbook-1",
-    "AIPS-workbook-day01-weeks1-3": "AIPS-workbook-1",
-    "AIPS-workbook-days2-3-weeks4-5": "AIPS-workbook-2",
-    "AIPS-workbook-days4-6-cp-modelling": "AIPS-workbook-3",
-    "AIPS-workbook-days7-9-cp-solving-1": "AIPS-workbook-4",
-    "AIPS-workbook-days10-12-ac4-and-mock": "AIPS-workbook-5",
-}
+# extension, some don't, and renamed copies keep their old names. Map any
+# alternate tablet names to their WORKBOOKS key here.
+ALIASES = {}
 
 
 def lookup_key(visible_name):
@@ -650,7 +639,8 @@ def brief_excerpt(brief_path, ptext, limit=14000):
 
 # Where each module's question-bearing PDFs live (relative to STUDY), and which
 # filenames count as papers. Deliberately excludes textbooks and lecture decks.
-QUESTION_DIRS = {"AIPS": ["AIPS/Practice_Questions"], "VICO": ["VICO/pdf"]}
+QUESTION_DIRS = {"MODULE-A": ["MODULE-A/past-papers"],
+                 "MODULE-B": ["MODULE-B/past-papers"]}
 SRC_NAME_RE = re.compile(r"exam|quiz|formative|paper|question", re.I)
 
 
@@ -674,7 +664,7 @@ def _q_markers(page, q):
         elif re.match(r"Ques.{0,3}on$", w[4]) and i + 1 < len(words) \
                 and words[i + 1][4] == str(q):
             tops.append(w[1])
-        # "3 (25 marks)" - the VICO exam rebuilds head their QUESTIONS section
+        # "3 (25 marks)" - some exam rebuilds head their QUESTIONS section
         # this way; the word "Question" only appears in the ANSWERS section,
         # which is exactly the wrong half to fetch from
         elif w[4] == str(q) and i + 2 < len(words) \
@@ -761,8 +751,9 @@ def find_question(module, q, hint=None):
                   if all(tk in os.path.basename(f).lower() for tk in toks)]
         cands = hinted or cands            # a hint that matches nothing is ignored
     # Default preference: example paper, then questions-only papers, then
-    # with-answers rebuilds, and the real-sitting export (Isaac's wrong answers
-    # embedded) or cohort feedback only if named by hint or nothing else matches.
+    # with-answers rebuilds, and real-sitting exports (the student's own
+    # uncorrected answers embedded) or cohort feedback only if named by hint
+    # or nothing else matches.
     def rank(f):
         n = os.path.basename(f).lower()
         if "example" in n:
@@ -875,19 +866,19 @@ def page_shot(pdf_path, page_idx, bbox=None):
 # --------------------------------------------------------------------------- #
 HEADER = u"[{workbook} | page {pageno} | {tag}] {colour} ink -> {action}"
 
-PROMPT = u"""You are tutoring Isaac for the {module} module through a workbook.
-Exam: {exam}. It is OPEN BOOK with internet access, no generative AI.
+PROMPT = u"""You are tutoring a student for the {module} module through a workbook.
+Exam: {exam}.
 You will get several requests from this workbook in a row; keep the context.
 
---- WHAT YOU ALREADY KNOW ABOUT HIM (earlier sessions) ---
+--- WHAT YOU ALREADY KNOW ABOUT THE STUDENT (earlier sessions) ---
 {memory}
 --- END ---
-Use this: chase patterns you have seen before, and say so when he repeats a
-mistake you have already flagged. Do not re-teach things he has demonstrably got.
+Use this: chase patterns you have seen before, and say so when they repeat a
+mistake you have already flagged. Do not re-teach things they have demonstrably got.
 
 {header}
 
-Read this image - it shows what he circled, with his handwriting:
+Read this image - it shows what they circled, with their handwriting:
 {image}
 
 Everything else you need is below; you should not need any other tool call.
@@ -903,10 +894,10 @@ Task: {task}
 
 Rules:
 - Use the brief's own answer and marking logic. Do not invent a different mark
-  scheme - his workbook's answer section must agree with what you tell him.
+  scheme - the workbook's answer section must agree with what you tell them.
 - If marking, give the mark as "n/m" and say precisely where marks were lost or
-  would be lost in the exam. Be strict; a generous mark is worthless to him.
-- Hold him to exam discipline: justify claims, show working, answer the question
+  would be lost in the exam. Be strict; a generous mark is worthless to them.
+- Hold them to exam discipline: justify claims, show working, answer the question
   actually asked.
 - Reply with the feedback ONLY - no preamble, no "here is my feedback". Under
   200 words. Plain text, no markdown headers.
@@ -914,18 +905,18 @@ Rules:
   (for marking include the mark, e.g. "VERDICT: D4(a) 3/5 - method right, arithmetic slip")
 {memrule}"""
 
-MEMRULE = u"""- Finally, if and only if you learned something durable about how he works,
+MEMRULE = u"""- Finally, if and only if you learned something durable about how they work,
   add ONE last line: MEMORY: <observation>. Record PATTERNS, not events -
   "drops nodes from the frontier when tracing by hand" or "solid on admissibility
   arguments", never "scored 2/5 on D3". A pattern is still true next week; a score
   is not. Skip the line entirely if nothing durable came up - most requests should
-  not produce one. This line is stripped before he sees the reply.
+  not produce one. This line is stripped before they see the reply.
 """
 
 TASKS = {
-    "mark": "Mark what he has written inside or beside the red circle.",
+    "mark": "Mark what they have written inside or beside the red circle.",
     "explain": ("Explain what is circled in blue. If there is blue handwriting, "
-                "treat it as his question and answer that specifically. Explain it "
+                "treat it as their question and answer that specifically. Explain it "
                 "DIFFERENTLY from how the workbook words it, and end with one short "
                 "check question."),
 }
@@ -933,29 +924,28 @@ TASKS = {
 # Grey "tutor" swaps the explain task for this. The standard rules still arrive
 # with every prompt, so the override has to name which of them stop applying -
 # otherwise the 200-word cap and the circled-work-only rule quietly win.
-TUTOR_TASK = u"""FULL-TUTOR MODE. This is a question to his personal tutor, and the following
-overrides the standard rules where they conflict:
-- The blue handwriting is the question; the circle only anchors where he is.
-  The question may be about ANYTHING - this module, exam strategy, his past
+TUTOR_TASK = u"""FULL-TUTOR MODE. This is a question to the student's personal tutor, and the
+following overrides the standard rules where they conflict:
+- The blue handwriting is the question; the circle only anchors where they are.
+  The question may be about ANYTHING - this module, exam strategy, their past
   performance - so answer the question actually asked, not the circled drill.
 - You have Read, Grep and Glob over the whole study tree. Start from:
     {module_root}/md/   converted study materials, if present
     the workbook PDFs and marking-notes files named in the WORKBOOKS map
-  Go and read what the question needs; never answer a question about his own
+  Go and read what the question needs; never answer a question about their own
   past work without opening the file that holds it.
 - The 200-word cap is lifted: up to 600 words when the question deserves it.
 - Everything else stands: strict standards, exam discipline, say it differently
   from the workbook, end with one check question, and the first line is still
   "VERDICT: <max 8 words>"."""
 
-DEEP_PROMPT = u"""You are Isaac's deep-dive tutor for the {module} module (exam {exam},
-open book for AIPS, closed book for VICO). He has enabled DEEP explain because he is
-STRUGGLING with something complex and wants as much perspective as possible. Take your
-time - depth is the point.
+DEEP_PROMPT = u"""You are a student's deep-dive tutor for the {module} module (exam {exam}).
+They have enabled DEEP explain because they are STRUGGLING with something complex and
+want as much perspective as possible. Take your time - depth is the point.
 
 {header}
 
-The image shows what he circled in blue (blue handwriting = his own question): {image}
+The image shows what they circled in blue (blue handwriting = their own question): {image}
 
 --- PRINTED TEXT OF THE PAGE ---
 {ptext}
@@ -976,8 +966,8 @@ Then write the explanation, structured as:
 1. The core idea in one short paragraph, in DIFFERENT words from the workbook.
 2. Two or three genuinely different angles - an analogy, a worked micro-example with
    fresh small numbers, or the design problem this idea was invented to solve.
-3. Where this shows up in HIS exam and what the marks are actually awarded for.
-4. The misconception most likely causing his confusion, named plainly.
+3. Where this shows up in THEIR exam and what the marks are actually awarded for.
+4. The misconception most likely causing their confusion, named plainly.
 5. One check question.
 
 Under 600 words, plain text, no markdown headers.
@@ -999,7 +989,7 @@ def claude_exe():
 def session_args(state, wb_key):
     """One live conversation per workbook.
 
-    Switching workbook ends the previous conversation (his stated preference),
+    Switching workbook ends the previous conversation (a deliberate choice),
     which also stops context growing without bound. Staying in one workbook
     resumes, so follow-ups keep the tutoring context AND hit the prompt cache -
     the second question on a page is markedly faster than the first.
@@ -1073,7 +1063,7 @@ Same rules as before. Under 200 words, first line "VERDICT: ...".
 
 FOLLOWUP_NEW_PAGE = u"""{header}
 
-He has moved to a new page in the same workbook. Image: {image}
+They have moved to a new page in the same workbook. Image: {image}
 
 --- PRINTED TEXT OF PAGE {pageno} ---
 {ptext}
@@ -1286,7 +1276,8 @@ def handle_command(crop_png, state, dry=False, page=None):
             q = guess_question(page[0], page[1], page[2])
             inferred = q is not None
         if q:
-            module = (page or (None, None, None, "AIPS"))[3]
+            default_mod = next(iter(QUESTION_DIRS), "")
+            module = (page or (None, None, None, default_mod))[3]
             found = find_question(module, q, hint)
             if found:
                 state["_shots"], desc = found
@@ -1401,8 +1392,10 @@ def handle(rel, state, dry=False):
         log("  !! workbook pdf missing: %s" % pdf_path)
         return 0, 0          # config problem - retrying will not help
     idx = order.index(page_uuid) if page_uuid in order else 0
-    module = "AIPS" if name.startswith("AIPS") else "VICO"
-    exam = "Wed 19 Aug 2026" if module == "AIPS" else "Thu 20 Aug 2026"
+    # The module is the first path segment of the workbook's source PDF - one
+    # folder per module is the convention the WORKBOOKS map documents.
+    module = pdf_rel.split("/")[0]
+    exam = EXAM_DATES.get(module, "not configured")
 
     done = failed = 0
     for g in trg:
@@ -1461,8 +1454,7 @@ def handle(rel, state, dry=False):
         mdl, eff = (DEEP_MODEL, DEEP_EFFORT) if deep else profile(state, g["kind"])
         try:
             if deep:
-                dctx = dict(ctx, module_root=os.path.join(
-                    STUDY, "AIPS" if module == "AIPS" else "VICO"))
+                dctx = dict(ctx, module_root=os.path.join(STUDY, module))
                 prompt = DEEP_PROMPT.format(**dctx)
                 log("     DEEP dispatch (%s/%s, timeout %ds)"
                     % (DEEP_MODEL, DEEP_EFFORT, DEEP_TIMEOUT))
@@ -1565,7 +1557,7 @@ def main():
                     pass
             offline_polls = 0
             # Settle gate: only act on a page once its mtime has held still for
-            # SETTLE_POLLS consecutive polls - i.e. Isaac has stopped writing.
+            # SETTLE_POLLS consecutive polls - i.e. the pen has gone quiet.
             # Without this, a pause at a line break commits half a question and
             # we would answer it mid-sentence.
             changed = []
