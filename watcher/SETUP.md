@@ -79,7 +79,7 @@ setx RM_STUDY_ROOT "C:\path\to\your\Study"
 ```
 Python must be **3.10+** (`rmscene` requires it). If you have several Pythons, the launcher pins `py -3.13` — edit it to match yours.
 
-Finally, edit the `WORKBOOKS` map at the top of `scripts/rm_feedback.py`: for each PDF you study on the tablet, map its tablet document name to `(source PDF path, marking-notes markdown path)`, both relative to `RM_STUDY_ROOT`. The marking notes are what answers get marked *against* — see `BUILD-YOUR-MODULE.md` for how to produce good ones.
+Finally, edit the `WORKBOOKS` map at the top of `rm_feedback.py` (beside this file): for each PDF you study on the tablet, map its tablet document name to `(source PDF path, marking-notes markdown path)`, both relative to `RM_STUDY_ROOT` — keep one folder per module, since the first path segment of the source PDF is treated as the module name. Fill in the `EXAM_DATES` dict beside the map so the tutor knows each module's exam. The marking notes are what answers get marked *against* — see `../workbook-pipeline/BUILD-YOUR-MODULE.md` for how to produce good ones.
 
 ## Daily use
 

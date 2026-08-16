@@ -1,6 +1,6 @@
 # Building a module: from a folder of PDFs to a tutored study sprint
 
-The ink loop (README) is the last mile. What makes it *worth* wiring up is the corpus behind it: clean markdown of your course, a mark-weighted plan, write-on workbooks, and marking notes for the tutor to mark against. This document is the pipeline that produced those, distilled from a real 100+ file, two-module build. The `skills/` folder packages each stage so a Claude Code agent can run it for you.
+The ink loop (`../watcher/`) is the last mile. What makes it *worth* wiring up is the corpus behind it: clean markdown of your course, a mark-weighted plan, write-on workbooks, and marking notes for the tutor to mark against. This document is the pipeline that produced those, distilled from a real 100+ file, two-module build. The `skills/` folder beside this file packages each stage so a Claude Code agent can run it for you.
 
 ## Stage 0 — What to collect (an hour on your VLE, the highest-value hour)
 
@@ -11,7 +11,7 @@ In descending order of value:
 4. Weekly quizzes/formatives **with answer keys**.
 5. The lecture decks, named so week and topic are recoverable.
 
-## Stage 1 — Convert to markdown (`scripts/extract_lectures.py`)
+## Stage 1 — Convert to markdown (`extract_lectures.py`, beside this file)
 
 Why not just read PDFs? Because everything downstream (plan-building, workbook-building, live tutoring) re-reads the material dozens of times, and markdown is ~50× cheaper per read — and greppable. The extractor already handles the four traps that silently corrupt naive extraction:
 
@@ -41,13 +41,13 @@ One PDF per study block, sized to a real session (2 h), built from **real past q
 
 ## Stage 4 — Tutor briefs (what red-circle marking marks against)
 
-One markdown per workbook: every drill's answer **with marking logic** (what earns each mark, where partial credit lives), a fresh alternative explanation per topic (different from the workbook's wording — re-reading the same explanation is worthless), common misconceptions, and the exam mapping. This file is what `rm_feedback.py` greps when you circle in red — its quality *is* the marking quality.
+One markdown per workbook: every drill's answer **with marking logic** (what earns each mark, where partial credit lives), a fresh alternative explanation per topic (different from the workbook's wording — re-reading the same explanation is worthless), common misconceptions, and the exam mapping. This file is what the watcher (`../watcher/rm_feedback.py`) greps when you circle in red — its quality *is* the marking quality.
 
 Protocol worth encoding at the top of each brief: **attempt-first** (never explain before an attempt), explain *differently* than the workbook, one check question per explanation, strict marking (a generous mark the week before an exam is worse than useless).
 
 ## Stage 5 — Wire the loop
 
-Add each workbook to `rm_feedback.py`'s `WORKBOOKS` map, put the PDFs on the tablet, start the watcher. From then on the cycle is: work in black → circle in red → turn page → keep working → read feedback at the block's end → erase circles.
+Add each workbook to the `WORKBOOKS` map in `../watcher/rm_feedback.py`, put the PDFs on the tablet, start the watcher (see `../watcher/SETUP.md`). From then on the cycle is: work in black → circle in red → turn page → keep working → read feedback at the block's end → erase circles.
 
 ## What this costs
 

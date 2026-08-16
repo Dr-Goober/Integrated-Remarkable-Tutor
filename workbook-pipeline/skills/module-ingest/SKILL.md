@@ -15,7 +15,7 @@ Report the classification table before reorganising if anything looks ambiguous;
 
 ## Step 2 — Extract with the four traps handled
 
-Use `scripts/extract_lectures.py` as the base (PyMuPDF). It already handles:
+Use the repo's `workbook-pipeline/extract_lectures.py` as the base (PyMuPDF). It already handles:
 
 1. **Symbol-font mojibake** — legacy SymbolMT maths extracts as Latin-1 (`á ñ` → `⟨ ⟩`, `¹` → `≠`, S/P/t → Σ/Π/τ). Mapping MUST be per-span by font, never global (`³` is a real superscript in body text but `≥` in Symbol). Verify every mapping against its surrounding line before applying; perfect pair-counts (e.g. equal `á` and `ñ`) are strong evidence.
 2. **Glyph-split monospace** — `l e t t i n g` → `letting`: rejoin runs of ≥3 single alphabetic tokens, breaking at lower→UPPER transitions.
