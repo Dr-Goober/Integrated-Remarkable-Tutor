@@ -22,7 +22,7 @@ ssh root@10.11.99.1
 ```
 If Windows shows no `10.11.99.x` interface at all: try the reMarkable's own cable (many USB-C cables are charge-only) and a rear motherboard port.
 
-**WLAN (so you can roam):** on firmware 3.x there is no Settings toggle for this — since ~3.22 SSH over Wi-Fi is silently disabled by updates. The tablet ships its own (undocumented) enable utility: over the USB connection, run:
+**WLAN (so you can roam):** there is no Settings toggle for this, and no live status indicator — the only mention in the UI is static small print on the same Copyrights page as the password, which also names the official enable command. Note that firmware updates silently disable it again. Over the USB connection, run:
 ```bash
 rm-ssh-over-wlan on
 ```
@@ -31,6 +31,7 @@ If your firmware lacks that binary, the manual equivalent is:
 touch /home/root/.config/remarkable/rm_enable_ssh_wifi_marker
 systemctl start dropbear-wlan.socket
 ```
+To check the current state later (there is no UI indicator): `ls ~/.config/remarkable/rm_enable_ssh_wifi_marker` over any SSH connection — the file existing means enabled. Or simply: if SSH over Wi-Fi connects, it's on.
 Then from the PC: `Test-NetConnection <tablet-ip> -Port 22` should say `TcpTestSucceeded: True`.
 
 **Give the tablet a static DHCP lease on your router** (its MAC is on the same About screen) or you'll be editing IPs after every lease renewal.
