@@ -22,7 +22,11 @@ ssh root@10.11.99.1
 ```
 If Windows shows no `10.11.99.x` interface at all: try the reMarkable's own cable (many USB-C cables are charge-only) and a rear motherboard port.
 
-**WLAN (so you can roam):** on firmware 3.x the Settings toggle often does NOT actually start the daemon — it only works if a marker file exists. Over the USB connection, run:
+**WLAN (so you can roam):** on firmware 3.x there is no Settings toggle for this — since ~3.22 SSH over Wi-Fi is silently disabled by updates. The tablet ships its own (undocumented) enable utility: over the USB connection, run:
+```bash
+rm-ssh-over-wlan on
+```
+If your firmware lacks that binary, the manual equivalent is:
 ```bash
 touch /home/root/.config/remarkable/rm_enable_ssh_wifi_marker
 systemctl start dropbear-wlan.socket
