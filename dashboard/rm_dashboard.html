@@ -361,7 +361,7 @@
   .cardBody img { max-width: 100%; border: 2px solid var(--border);
                   border-radius: 5px; margin-top: 10px; }
   /* The circled crop is no longer shown inline on mark/explain cards - it is a
-     picture of the page he is already holding, so it just pushed the feedback
+     picture of the page they are already holding, so it just pushed the feedback
      off screen. This opens it over the page on demand instead. */
   .cropLink {
     display: inline-block; margin-top: 10px; font-size: 12.5px;
@@ -686,6 +686,9 @@
        ends up beside them: star / download / delete / dots */
     .pinBtn { transition: transform .3s ease; }
     .card.actOpen .pinBtn { transform: translateX(-81px); }
+    /* a card with nothing to download shows only the bin, so the star has one
+       button less to clear: 34px + one 7px gap instead of 74px + 7px */
+    .card.actOne.actOpen .pinBtn { transform: translateX(-41px); }
     /* 34px keeps the four-button group inside the row */
     .actBtn { width: 34px; height: 34px; }
     .actBtn svg { width: 16px; height: 16px; }
@@ -857,6 +860,65 @@ const ICON_BIN = '<svg ' + SVG + '><path d="M2.4 4h11.2M6.4 4V2.4h3.2V4"/>' +
 const shortWb = w => PHONE
   ? String(w || "").replace(/^([A-Za-z]+)-workbook-(\d+)$/i, "$1 WB$2")
   : w;
+
+/* ---------- downloads ----------
+   A mark or an explanation is two things: the feedback, and the work it is
+   about. Downloading one without the other is close to useless a week later,
+   so they come down together in a folder named after the question.
+
+   Browsers cannot create a folder from a download, so the pair is zipped.
+   PNGs are already compressed, so entries are STORED rather than deflated -
+   that keeps this to a CRC and a few headers instead of a compression library. */
+const CRC_T = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+const crc32 = u8 => {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+};
+function zipStore(files) {                 // [{name, data: Uint8Array}] -> Blob
+  const enc = new TextEncoder(), parts = [], central = [];
+  let off = 0;
+  for (const f of files) {
+    const nm = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, n, true);
+    lh.setUint32(22, n, true);   lh.setUint16(26, nm.length, true);
+    parts.push(new Uint8Array(lh.buffer), nm, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true);
+    ch.setUint16(6, 20, true);         ch.setUint32(16, crc, true);
+    ch.setUint32(20, n, true);         ch.setUint32(24, n, true);
+    ch.setUint16(28, nm.length, true); ch.setUint32(42, off, true);
+    central.push(new Uint8Array(ch.buffer), nm);
+    off += 30 + nm.length + n;
+  }
+  const clen = central.reduce((a, c) => a + c.length, 0);
+  const eo = new DataView(new ArrayBuffer(22));
+  eo.setUint32(0, 0x06054b50, true);
+  eo.setUint16(8, files.length, true); eo.setUint16(10, files.length, true);
+  eo.setUint32(12, clen, true);        eo.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(eo.buffer)],
+                  {type: "application/zip"});
+}
+const slugify = s => (s || "").replace(/[^\w\s.-]/g, "").trim()
+                              .replace(/\s+/g, "-").replace(/-+/g, "-");
+const saveBlob = (blob, name) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.download = name; a.href = url; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+};
+const fetchBytes = async name =>
+  new Uint8Array(await (await fetch("/img/" + encodeURIComponent(name))).arrayBuffer());
 
 /* ---------- crop lightbox ----------
    One element reused by every card. Clicking anywhere on the overlay closes
@@ -1180,7 +1242,7 @@ function applyArrivals(resps) {
 function esc(s) { const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
 
 /* matrix mode: card screenshots are remapped per-pixel - white paper goes
-   black, black print goes matrix green - while SATURATED pixels (his red and
+   black, black print goes matrix green - while SATURATED pixels (the red and
    blue pen ink) keep their original colour, blended smoothly at antialiased
    edges. Originals restore themselves when the theme changes back, because
    the feed rebuilds from the untouched /img/ URLs. */
@@ -1246,12 +1308,9 @@ function renderFeed(resps) {
     } else if (kd === "command") {
       score = " kind-command";
     }
-    card.className = "card" + score + (expanded.has(r.id) ? " open" : "")
-                   + (r.id === maxId ? " focus" : "")
-                   + (pinned.has(r.id) ? " pinnedCard" : "");
     const where = (r.wb ? shortWb(r.wb) : "") + (r.page ? " p." + r.page : "");
     // mark/explain/deep are sent [crop, ...tutor attachments]. The crop is a
-    // photo of the page he is holding, so it goes behind a link; anything the
+    // photo of the page being worked on, so it goes behind a link; anything the
     // tutor deliberately attached (a lecture figure it refers to) stays inline.
     // Command cards are all-crop by design, so they are left alone.
     const imgs = r.images || [];
@@ -1262,6 +1321,15 @@ function renderFeed(resps) {
     const cropCard = kd === "command" && imgs.length > 0;
     const cropImg = (cropFirst || cropCard) ? imgs[0] : null;
     const inlineImgs = (cropFirst || cropCard) ? imgs.slice(1) : imgs;
+    // Only cards that carry something worth keeping get a download button.
+    // A status/help/model-switch reply is a transient answer with no image -
+    // downloading a picture of the words is not useful, so it is left off.
+    const canSave = imgs.length > 0;
+    const saveLabel = cropCard ? "Download screenshot" : "Download (2 PNGs)";
+    card.className = "card" + score + (expanded.has(r.id) ? " open" : "")
+                   + (r.id === maxId ? " focus" : "")
+                   + (pinned.has(r.id) ? " pinnedCard" : "")
+                   + (canSave ? "" : " actOne");
     card.innerHTML =
       '<div class="cardHead">' +
         '<span class="kind">' + esc((r.kind || "").toUpperCase()) + '</span>' +
@@ -1269,11 +1337,13 @@ function renderFeed(resps) {
         '<span class="titleTxt">' + esc(r.title) + '</span>' +
         '<button class="pinBtn' + (pinned.has(r.id) ? " pinned" : "") + '" title="pin">&#9733;</button>' +
         '<span class="cardAct">' +
-          '<button class="actBtn actSave" title="save as PNG">' + ICON_DL + '</button>' +
+          (canSave ? '<button class="actBtn actSave" title="' + saveLabel +
+                     '">' + ICON_DL + '</button>' : "") +
           '<button class="actBtn actDel" title="delete">' + ICON_BIN + '</button>' +
         '</span>' +
         '<button class="menuBtn" title="more">&#8942;</button>' +
-        '<div class="cardMenu"><div class="mi save">Save as PNG</div>' +
+        '<div class="cardMenu">' +
+        (canSave ? '<div class="mi save">' + saveLabel + '</div>' : "") +
         // only the newest card offers the bulk clear, and only once expanded
         (r.id === maxId ? '<div class="mi delBelow">Delete all responses below</div>' : '') +
         '<div class="mi del">Delete</div></div>' +
@@ -1337,17 +1407,39 @@ function renderFeed(resps) {
     };
 
     // shared by the dropdown items and the inline buttons
-    const doSave = async () => {
-      if (!window.html2canvas) { alert("PNG export needs internet (html2canvas CDN)"); return; }
+    // folder / file stem: the question or topic this card is about
+    const stem = [slugify(r.wb), r.page ? "p" + r.page : null, slugify(r.title)]
+      .filter(Boolean).join("_").slice(0, 90) || ("response-" + r.id);
+
+    const cardPng = async () => {
+      if (!window.html2canvas) {
+        alert("PNG export needs internet (html2canvas CDN)"); return null;
+      }
+      // render it expanded even if it is collapsed, then put it back
       const wasOpen = card.classList.contains("open");
       card.classList.add("open");
       const canvas = await html2canvas(card, {
         backgroundColor: getComputedStyle(document.body).backgroundColor, scale: 2});
       if (!wasOpen) card.classList.remove("open");
-      const a = document.createElement("a");
-      a.download = "response-" + r.id + "-" + (r.wb || "card") + ".png";
-      a.href = canvas.toDataURL("image/png");
-      a.click();
+      return await new Promise(res => canvas.toBlob(res, "image/png"));
+    };
+
+    const doSave = async () => {
+      // A grey crop card IS its screenshot - a picture of the card would just
+      // be a picture of the words "Click to open screenshot".
+      if (cropCard) {
+        saveBlob(new Blob([await fetchBytes(cropImg)], {type: "image/png"}),
+                 stem + ".png");
+        return;
+      }
+      // mark / explain / deep: the feedback and the work it is about, together
+      const shot = await cardPng();
+      if (!shot) return;
+      const files = [{name: stem + "/feedback.png",
+                      data: new Uint8Array(await shot.arrayBuffer())}];
+      if (cropImg)
+        files.push({name: stem + "/your-work.png", data: await fetchBytes(cropImg)});
+      saveBlob(zipStore(files), stem + ".zip");
     };
     const doDelete = async () => {
       card.classList.add("purging");          // pulse: nothing moves yet
@@ -1360,13 +1452,15 @@ function renderFeed(resps) {
       renderedKey = ""; tick();               // rebuild is now a visual no-op
     };
 
-    menu.querySelector(".save").onclick = e => {
+    const miSave = menu.querySelector(".save");
+    if (miSave) miSave.onclick = e => {
       e.stopPropagation(); menu.classList.remove("open"); doSave();
     };
     menu.querySelector(".del").onclick = e => {
       e.stopPropagation(); menu.classList.remove("open"); doDelete();
     };
-    card.querySelector(".actSave").onclick = e => {
+    const btnSave = card.querySelector(".actSave");
+    if (btnSave) btnSave.onclick = e => {
       e.stopPropagation(); card.classList.remove("actOpen"); doSave();
     };
     card.querySelector(".actDel").onclick = e => {
