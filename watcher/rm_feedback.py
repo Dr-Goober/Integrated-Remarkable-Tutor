@@ -72,6 +72,9 @@ XOCHITL = "/home/root/.local/share/remarkable/xochitl"
 
 NTFY_TOPIC = os.environ.get("RM_NTFY_TOPIC", "CHANGE-ME-long-random-string")
 NTFY_URL = "https://ntfy.sh/" + NTFY_TOPIC
+# Phone push is OFF by default - the dashboard already shows every reply, so
+# the ntfy round-trip is just a second copy. RM_NTFY=1 turns it back on.
+NTFY_ENABLED = os.environ.get("RM_NTFY", "0").lower() in ("1", "true", "yes", "on")
 
 # Local dashboard: a read-only mirror of the loop served on this machine.
 # RM_WEB_HOST=0.0.0.0 opens it to the LAN (phone browser); default is local.
@@ -830,6 +833,76 @@ MEM_DIR = os.path.join(HERE, ".rm_memory")
 MEM_MAX_LINES = 90               # oldest are dropped; patterns should recur anyway
 
 
+# --------------------------------------------------------------------------- #
+# mark -> explain handoff
+# --------------------------------------------------------------------------- #
+# The marker writes its latest verdict per question here and the explainer reads
+# it back. Today both channels share one resumed conversation, so this is
+# belt-and-braces - but it survives what the session does not: a workbook switch
+# wipes the session, and so does a restart. It is also the prerequisite for
+# running the two as genuinely separate threads, since after this the explainer
+# no longer needs the marker's transcript to know what was just marked.
+MARK_DIR = os.path.join(HERE, ".rm_marks")
+MARK_KEEP = 40                   # per workbook; oldest questions drop off
+
+
+def mark_path(wb):
+    return os.path.join(MARK_DIR, "%s.json" % wb)
+
+
+def mark_key(pageno, verdict):
+    """One slot per question: a drill/exercise label when the verdict names one
+    (they open "D4(a) 3/5 - ..."), otherwise the page. Keying on the label means
+    re-marking the same drill REPLACES the entry rather than piling up."""
+    m = re.match(r"\s*([DE]\d+)", verdict or "")
+    return "%s p%d" % (m.group(1), pageno) if m else "p%d" % pageno
+
+
+def save_mark(wb, pageno, verdict, body):
+    """Record the most recent mark for one question. Never raises - a failure
+    here must not cost them the feedback itself."""
+    try:
+        os.makedirs(MARK_DIR, exist_ok=True)
+        try:
+            data = json.load(io.open(mark_path(wb), encoding="utf-8"))
+        except Exception:
+            data = {}
+        data[mark_key(pageno, verdict)] = {
+            "ts": time.strftime("%Y-%m-%d %H:%M"), "page": pageno,
+            "verdict": (verdict or "").strip(),
+            "body": (body or "").strip()[:1200],
+        }
+        if len(data) > MARK_KEEP:                  # drop the oldest by timestamp
+            for k in sorted(data, key=lambda k: data[k]["ts"])[:len(data) - MARK_KEEP]:
+                data.pop(k, None)
+        with io.open(mark_path(wb), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=1, ensure_ascii=False))
+    except Exception as e:
+        log("  !! could not save mark: %s" % e)
+
+
+def load_marks(wb, pageno, limit=3):
+    """What the marker last said about this page, newest first, for the
+    explainer's prompt. Returns "" when there is nothing worth sending."""
+    try:
+        data = json.load(io.open(mark_path(wb), encoding="utf-8"))
+    except Exception:
+        return ""
+    here = [(k, v) for k, v in data.items() if v.get("page") == pageno]
+    if not here:
+        return ""
+    here.sort(key=lambda kv: kv[1].get("ts", ""), reverse=True)
+    out = []
+    for k, v in here[:limit]:
+        out.append("[%s, %s] %s\n%s" % (k, v.get("ts", "?"),
+                                        v.get("verdict", ""), v.get("body", "")))
+    return ("\n--- HOW HIS WORK ON THIS PAGE WAS MARKED (most recent first) ---\n"
+            + "\n\n".join(out)
+            + "\n--- END ---\nThis is what the marker already told them. Build on "
+              "it rather than repeating it, and do not contradict a mark without "
+              "saying plainly that you are doing so.\n")
+
+
 def mem_path(module):
     return os.path.join(MEM_DIR, "%s.md" % module)
 
@@ -1192,10 +1265,14 @@ def guess_question(pdf_path, page_idx, bbox=None):
     return None
 
 
-def page_shot(pdf_path, page_idx, bbox=None):
+def page_shot(pdf_path, page_idx, bbox=None, crop_only=False):
     """Clean high-res renders of the source page - the PDF's own pixels, no ink.
     For when the tablet mangles a question's display. Returns [region?, full],
-    region first so the thing they asked about is the primary attachment."""
+    region first so the thing they asked about is the primary attachment.
+
+    crop_only: the box IS the request (a drawn grey box), so return just the
+    crop and skip the whole-page render. It also bypasses the 180px height
+    test, because an explicit box around one line is still an explicit box."""
     doc = pymupdf.open(pdf_path)
     page = doc[page_idx]
     pw, ph = page.rect.width, page.rect.height
@@ -1204,12 +1281,15 @@ def page_shot(pdf_path, page_idx, bbox=None):
     if bbox:
         x0, y0, x1, y1 = bbox
         # taller than a written word = they circled a region, so crop to it
-        if (y1 - y0) > 180:
+        if (y1 - y0) > 180 or crop_only:
             r = pymupdf.Rect(max(0, s * x0 + pw / 2 - 15), max(0, s * y0 - 15),
                              min(pw, s * x1 + pw / 2 + 15), min(ph, s * y1 + 15))
             p = os.path.join(WORK_DIR, "shot_p%d_region.png" % (page_idx + 1))
             page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=r).save(p)
             shots.append(p)
+    if crop_only and shots:
+        doc.close()
+        return shots
     p = os.path.join(WORK_DIR, "shot_p%d_page.png" % (page_idx + 1))
     page.get_pixmap(matrix=pymupdf.Matrix(3, 3)).save(p)
     shots.append(p)
@@ -1231,7 +1311,7 @@ You will get several requests from this workbook in a row; keep the context.
 --- END ---
 Use this: chase patterns you have seen before, and say so when they repeat a
 mistake you have already flagged. Do not re-teach things they have demonstrably got.
-
+{marks}
 {header}
 
 Read this image - it shows what they circled, with their handwriting:
@@ -1406,8 +1486,17 @@ def request_stop():
     return True
 
 
-def session_args(state, wb_key):
-    """One live conversation per workbook.
+def lane_key(wb_key, kind):
+    """One conversation per workbook PER CHANNEL. Mark and explain used to share
+    a session, which is why they could never run at the same time: two concurrent
+    `claude --resume <same id>` would race the transcript. Splitting them is what
+    lets the lanes run concurrently - the explainer no longer needs the marker's
+    transcript, because it reads the marks back from .rm_marks (see save_mark)."""
+    return "%s|%s" % (wb_key, kind)
+
+
+def session_args(state, wb_key, skey):
+    """One live conversation per (workbook, channel) - `skey` from lane_key().
 
     Switching workbook ends the previous conversation (the user's stated preference),
     which also stops context growing without bound. Staying in one workbook
@@ -1423,12 +1512,12 @@ def session_args(state, wb_key):
         state["active_wb"] = wb_key
         state["sessions"] = {}
         state["sess_n"] = {}
-        state["last_page"] = None
-    sid = state.setdefault("sessions", {}).get(wb_key)
+        state["last_page"] = {}
+    sid = state.setdefault("sessions", {}).get(skey)
     if sid:
         return ["--resume", sid], False
     sid = str(_uuid.uuid4())
-    state["sessions"][wb_key] = sid
+    state["sessions"][skey] = sid
     return ["--session-id", sid], True
 
 
@@ -1562,10 +1651,10 @@ preamble:
 3. Any standing instructions or preferences stated during the conversation."""
 
 
-def compact_session(state, wb_key):
+def compact_session(state, skey):
     """-> handover text (or None). Ends the workbook's current conversation
     either way; the caller's next session_args() starts a fresh one."""
-    sid = state.get("sessions", {}).get(wb_key)
+    sid = state.get("sessions", {}).get(skey)
     summary = None
     if sid:
         try:
@@ -1574,24 +1663,28 @@ def compact_session(state, wb_key):
         except Exception as e:
             log("     compact failed (%s) - rotating without handover"
                 % str(e)[:60])
-    state.get("sessions", {}).pop(wb_key, None)
-    state.get("sess_n", {}).pop(wb_key, None)
+    state.get("sessions", {}).pop(skey, None)
+    state.get("sess_n", {}).pop(skey, None)
     return summary
 
 
 def ask_claude(ctx, model, effort, state, wb_key, dry=False):
-    n = state.setdefault("sess_n", {}).get(wb_key, 0)
+    # session bookkeeping is per (workbook, channel) so mark and explain can run
+    # side by side without sharing - and corrupting - one transcript
+    skey = lane_key(wb_key, ctx["kind"])
+    n = state.setdefault("sess_n", {}).get(skey, 0)
     if (not dry and n >= COMPACT_AFTER
-            and state.get("sessions", {}).get(wb_key)):
+            and state.get("sessions", {}).get(skey)):
         log("     compacting %s conversation after %d requests" % (wb_key, n))
-        handover = compact_session(state, wb_key)
+        handover = compact_session(state, skey)
         if handover:
             ctx["memory"] = (ctx["memory"] +
                 "\n\n--- HANDOVER from your previous conversation on this "
                 "workbook (compacted: final outcomes; their errors along the "
                 "way are kept deliberately) ---\n" + handover)
-    args, is_new = session_args(state, wb_key)
-    same_page = (not is_new) and state.get("last_page") == (wb_key, ctx["pageno"])
+    args, is_new = session_args(state, wb_key, skey)
+    same_page = (not is_new) and \
+        state.get("last_page", {}).get(skey) == ctx["pageno"]
 
     if is_new:
         tpl, why = PROMPT, "new session"
@@ -1615,16 +1708,16 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
         # a resume can fail if the transcript was cleaned up - start over once
         if not is_new and "resume" in (" ".join(args) + str(e)).lower():
             log("     resume failed, starting a fresh conversation")
-            state["sessions"].pop(wb_key, None)
-            state.get("sess_n", {}).pop(wb_key, None)
-            args, _ = session_args(state, wb_key)
+            state["sessions"].pop(skey, None)
+            state.get("sess_n", {}).pop(skey, None)
+            args, _ = session_args(state, wb_key, skey)
             prompt = PROMPT.format(task=task, **ctx)
             out = run_claude(prompt, model, effort, tools="Read Grep Glob", extra=args)
         else:
             raise
-    state["last_page"] = (wb_key, ctx["pageno"])
-    state.setdefault("sess_n", {})[wb_key] = \
-        state.get("sess_n", {}).get(wb_key, 0) + 1
+    state.setdefault("last_page", {})[skey] = ctx["pageno"]
+    state.setdefault("sess_n", {})[skey] = \
+        state.get("sess_n", {}).get(skey, 0) + 1
     return out
 
 
@@ -1720,6 +1813,7 @@ FETCH A QUESTION IMAGE
 'screenshot q1 real' / 'q3 game theory' / 'q1 formative' - name the paper
 'screenshot from the exam paper' - infers the question from the page you're on
 'screenshot' alone + a grey circle - renders the circled region of THIS page
+a grey BOX around anything, no words needed - sends just that crop
 (sources and exact pages: workbooks/QUESTION-LOOKUP.md)
 
 MODELS AND EFFORT
@@ -1807,6 +1901,13 @@ def handle_command(crop_png, state, dry=False, page=None, doc=None):
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     said = min(lines, key=len) if lines else ""
     kind, arg = classify(said)
+    # A drawn BOX with nothing legible in it is grey used as a framing gesture,
+    # not as writing: crop what was boxed and send that. Gated on "unknown" so
+    # every real command still wins, and on a size a scrawled word cannot reach.
+    if kind == "unknown" and page and page[2]:
+        bw, bh = page[2][2] - page[2][0], page[2][3] - page[2][1]
+        if bw > 160 and bh > 80:
+            kind, arg = "crop", None
     log("     transcribed %r -> %s %s" % (said[:80], kind, arg or ""))
 
     def describe():
@@ -1872,6 +1973,13 @@ def handle_command(crop_png, state, dry=False, page=None, doc=None):
         return GUIDE_TEXT, "the 60-second guide"
     if kind == "help":
         return HELP_TEXT, "command list"
+    if kind == "crop":
+        if not page:
+            return "No page context - draw the box on a workbook page.", "crop failed"
+        state["_shots"] = page_shot(page[0], page[1], page[2], crop_only=True)
+        # no prose - the crop IS the answer, and the dashboard opens it from the
+        # card itself rather than expanding one, so the title is the instruction
+        return "", "Click to open screenshot"
     if kind == "screenshot":
         q, hint = arg if isinstance(arg, tuple) else (None, None)
         inferred = False
@@ -1964,6 +2072,8 @@ def notify(title, body, image=None, priority="default", tags=None, dry=False):
     if dry:
         log("DRY-RUN notify: [%s] %s" % (title, body[:120]))
         return
+    if not NTFY_ENABLED:
+        return
     import urllib.request
     hdrs = {"Title": title.encode("utf-8"), "Priority": priority}
     if tags:
@@ -1986,6 +2096,40 @@ def notify(title, body, image=None, priority="default", tags=None, dry=False):
 # local dashboard (read-only mirror; the ink stays the only control surface)
 # --------------------------------------------------------------------------- #
 DASH_PATH = os.path.join(HERE, "rm_dashboard.html")
+
+# --- home-screen app assets ------------------------------------------------
+# The dashboard is plain HTTP on the LAN, so there is no service worker and no
+# web push (iOS requires HTTPS for both). What these DO buy is "Add to Home
+# Screen": an icon, a name, and a standalone chrome-less window. Icons are
+# drawn once at import and held in memory - no files on disk, so nothing here
+# for OneDrive to sync or conflict over.
+APP_NAME = "Study Watcher"
+
+
+def _app_icon(size):
+    """The red marking circle on near-black: the tool's one gesture, and still
+    legible at 60px on a home screen. Drawn at 4x and downsampled because PIL
+    has no antialiased ellipse stroke."""
+    s = size * 4
+    img = Image.new("RGB", (s, s), (28, 28, 26))
+    d = ImageDraw.Draw(img)
+    pad, w = int(s * 0.20), max(1, int(s * 0.075))
+    d.ellipse([pad, pad, s - pad, s - pad], outline=(255, 30, 70), width=w)
+    buf = io.BytesIO()
+    img.resize((size, size), Image.LANCZOS).save(buf, "PNG")
+    return buf.getvalue()
+
+
+APP_ICONS = {"/icon-%d.png" % n: _app_icon(n) for n in (180, 192, 512)}
+
+WEB_MANIFEST = {
+    "name": APP_NAME, "short_name": "Study",
+    "start_url": "/", "scope": "/", "display": "standalone",
+    "background_color": "#1c1c1a", "theme_color": "#1c1c1a",
+    "icons": [{"src": "/icon-%d.png" % n, "sizes": "%dx%d" % (n, n),
+               "type": "image/png", "purpose": "any maskable"}
+              for n in (192, 512)],
+}
 
 
 class WebState:
@@ -2137,10 +2281,16 @@ def start_web():
         def log_message(self, *a):
             pass
 
-        def _send(self, code, ctype, data):
+        # cache: /state must never be cached, but the PNGs are written once
+        # under a unique name (web_<rid>_<n>.png) and never rewritten, so they
+        # can be cached hard. Without this every feed rebuild re-downloaded
+        # every image, which is why they visibly reloaded on unrelated clicks.
+        IMMUTABLE = "public, max-age=31536000, immutable"
+
+        def _send(self, code, ctype, data, cache="no-store"):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -2166,12 +2316,19 @@ def start_web():
                     self._send(200, "application/json",
                                json.dumps({"stopped": request_stop()})
                                .encode("utf-8"))
+                elif path == "/manifest.webmanifest":
+                    self._send(200, "application/manifest+json",
+                               json.dumps(WEB_MANIFEST).encode("utf-8"))
+                elif path in APP_ICONS:
+                    self._send(200, "image/png", APP_ICONS[path],
+                               cache=self.IMMUTABLE)
                 elif path.startswith("/img/"):
                     name = os.path.basename(path[5:])
                     p = os.path.join(WORK_DIR, name)
                     if name.endswith(".png") and os.path.exists(p):
                         with open(p, "rb") as fh:
-                            self._send(200, "image/png", fh.read())
+                            self._send(200, "image/png", fh.read(),
+                                       cache=self.IMMUTABLE)
                     else:
                         self._send(404, "text/plain", b"not found")
                 else:
@@ -2225,10 +2382,12 @@ def handle(rel, state, dry=False):
     # greys first: a 'begin' on this page must release the page's own held ink
     # in the same pass, not one poll later
     trg.sort(key=lambda g: g["kind"] != "command")
+
+    # Patience mode is settled BEFORE anything starts, so held ink never lights
+    # a chip. Held ink counts as "failed" below so its page stays un-seen and
+    # refires after 'begin'.
+    runnable = []
     for g in trg:
-        # patience mode: grey 'wait' was written - hold every coloured trigger
-        # (grey still runs, or 'begin' could never be seen). Held ink counts as
-        # "failed" below so its page stays un-seen and refires after 'begin'.
         if state.get("waiting") and g["kind"] != "command":
             if g["hash"] not in state.setdefault("wait_seen", []):
                 state["wait_seen"].append(g["hash"])
@@ -2236,14 +2395,28 @@ def handle(rel, state, dry=False):
                     % (g["colour"], name, idx + 1))
             deferred += 1
             continue
-        log("  %s trigger on %s p.%d (hash %s)" % (g["colour"], name, idx + 1, g["hash"]))
-        WEB.set_wb(key)
-        jid = WEB.job_start(g["kind"], key, idx + 1)
-        STOP_EVT.clear()          # each job starts with a clean stop flag
+        runnable.append(g)
+    if not runnable:
+        return 0, deferred
+
+    # Every chip lights on DETECTION, not when its agent gets a turn: all the
+    # jobs are registered here, before any of them runs.
+    WEB.set_wb(key)
+    STOP_EVT.clear()              # one clean stop flag for this whole batch
+    for g in runnable:
+        log("  %s trigger on %s p.%d (hash %s)"
+            % (g["colour"], name, idx + 1, g["hash"]))
+        g["_jid"] = WEB.job_start(g["kind"], key, idx + 1)
         notify("%s - %s p.%d - working..." % (g["kind"].upper(), name, idx + 1),
                "Seen your %s circle. Working on it." % g["colour"].lower(),
                priority="low", tags="eyes", dry=dry)
 
+    def run_one(g):
+        """One trigger, start to finish. -> "done" | "failed". Runs on its
+        lane's thread, so everything it touches in `state` must belong to that
+        lane (sessions and sess_n are per-lane; `answered` is a list append,
+        which is atomic)."""
+        jid = g["_jid"]
         full, crop = render(pdf_path, idx, strokes, crop=g["bbox"])
         # the trigger hash goes into the filename: resumed conversations have
         # earlier captures in context, and a REUSED path would let the model
@@ -2270,15 +2443,13 @@ def handle(rel, state, dry=False):
                 WEB.job_end(jid)
                 STOP_EVT.clear()
                 state["answered"].append(g["hash"])
-                done += 1
-                continue
+                return "done"
             except Exception as e:
                 log("  !! command failed: %s" % e)
                 notify("CMD ERROR", str(e)[:400], priority="high",
                        tags="warning", dry=dry)
                 WEB.job_end(jid)
-                failed += 1
-                continue
+                return "failed"
             shots = state.pop("_shots", [])       # transient - never persisted
             notify("CMD - %s" % short, body, tags="gear", dry=dry,
                    image=(shots[0] if shots else None))
@@ -2289,8 +2460,7 @@ def handle(rel, state, dry=False):
             WEB.add_time("command", time.time() - t0)
             WEB.add_response("command", key, idx + 1, short, body, shots)
             state["answered"].append(g["hash"])
-            done += 1
-            continue
+            return "done"
 
         ptext = page_text(pdf_path, idx)
         ctx = {"module": module, "exam": exam, "workbook": key, "pageno": idx + 1,
@@ -2299,7 +2469,10 @@ def handle(rel, state, dry=False):
                "ptext": ptext, "excerpt": brief_excerpt(brief_path, ptext),
                "tag": location_tag(ptext),
                "memrule": MEMRULE + (ATTACH_RULE if g["kind"] == "explain" else ""),
-               "memory": load_memory(module) or "(nothing recorded yet)"}
+               "memory": load_memory(module) or "(nothing recorded yet)",
+               # only the explainer needs it; the marker is the one writing it
+               "marks": (load_marks(key, idx + 1)
+                         if g["kind"] == "explain" else "")}
         ctx["header"] = HEADER.format(**ctx)
         log("  -> %s" % ctx["header"])
         # DEEP explain: standalone agent, fresh every time, full-corpus tools.
@@ -2331,16 +2504,14 @@ def handle(rel, state, dry=False):
             WEB.job_end(jid)
             STOP_EVT.clear()
             state["answered"].append(g["hash"])
-            done += 1
-            continue
+            return "done"
         except Exception as e:
             log("  !! claude failed: %s" % e)
             log("     -> leaving this page pending; it will retry each poll")
             notify("ERROR - %s p.%d" % (name, idx + 1), str(e)[:400],
                    priority="high", tags="warning", dry=dry)
             WEB.job_end(jid)
-            failed += 1
-            continue
+            return "failed"
 
         if not deep:                      # deep dives would skew the average
             WEB.add_time(g["kind"], time.time() - t0)
@@ -2378,6 +2549,9 @@ def handle(rel, state, dry=False):
             first, _, rest = reply.partition("\n")
             verdict = first.strip()[:120] or g["kind"]
         kind_label = "DEEP" if deep else g["kind"].upper()
+        # hand this verdict to the explain channel (see save_mark)
+        if g["kind"] == "mark":
+            save_mark(key, idx + 1, verdict, rest.strip() or reply)
         title = "%s - %s p.%d - %s" % (kind_label, name, idx + 1, verdict)
         notify(title[:200], (rest.strip() or reply),
                image=(crop_png if g["kind"] == "mark" else None),
@@ -2395,8 +2569,38 @@ def handle(rel, state, dry=False):
                          (rest.strip() or reply),
                          [crop_png or full_png] + extra_imgs)
         state["answered"].append(g["hash"])
-        done += 1
-    return done, failed + deferred
+        return "done"
+
+    # One lane per channel. Inside a lane the work is sequential, because a lane
+    # owns a Claude session and two concurrent --resume on one id would race the
+    # transcript. Across lanes it is genuinely parallel, so mark, explain and
+    # command overlap and all three chips blink at once.
+    lanes = {}
+    for g in runnable:
+        lanes.setdefault(g["kind"], []).append(g)
+
+    results, rlock = [], threading.Lock()
+
+    def run_lane(items):
+        for g in items:
+            try:
+                r = run_one(g)
+            except Exception as e:                  # never strand a lit chip
+                log("  !! %s lane crashed: %s" % (g["kind"], e))
+                log(traceback.format_exc())
+                WEB.job_end(g["_jid"])
+                r = "failed"
+            with rlock:
+                results.append(r)
+
+    threads = [threading.Thread(target=run_lane, args=(v,), daemon=True)
+               for v in lanes.values()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()          # the caller saves state, so nothing may still be running
+
+    return results.count("done"), results.count("failed") + deferred
 
 
 def main():
@@ -2433,7 +2637,7 @@ def main():
         log("cleared conversation(s) from the previous launch")
     state.pop("sess_n", None)
     state["active_wb"] = None
-    state["last_page"] = None
+    state["last_page"] = {}          # per (workbook, channel); see lane_key()
 
     if args.test_page:
         state["answered"] = []          # so an already-answered circle still fires

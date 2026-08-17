@@ -3,5 +3,7 @@ __pycache__/
 .rm_feedback_state.json
 .rm_feedback_tmp/
 .rm_memory/
+.rm_marks/
+.rm_progress/
 rm_feedback.log
 page.png
