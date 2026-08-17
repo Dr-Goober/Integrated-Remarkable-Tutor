@@ -643,7 +643,8 @@ def progress_scan(doc_uuid, order, pdf_map, wb_key, pdf_path, brief_path,
             # tablet position -> PDF page: an inserted notes page would
             # otherwise render the wrong page for every page after it
             pidx, _ins = pdf_page_for(pdf_map, i)
-            full, _ = render(pdf_path, pidx, parse_strokes(local), crop=None)
+            full, _ = render(pdf_path, pidx, parse_strokes(local), crop=None,
+                             blank=_ins)
             p = os.path.join(WORK_DIR, "prog_%s_p%d.png" % (wb_key, pidx + 1))
             full.save(p)
             shots.append(p)
@@ -860,7 +861,15 @@ def _union(a, b):
 # --------------------------------------------------------------------------- #
 # render
 # --------------------------------------------------------------------------- #
-def render(pdf_path, page_idx, strokes, crop=None, zoom=2.4):
+def render(pdf_path, page_idx, strokes, crop=None, zoom=2.4, blank=False):
+    """Draw the ink over the source page.
+
+    blank=True renders it on an empty sheet of the same size instead. That is
+    for pages INSERTED on the tablet: they have no page behind them, and a
+    notes page resolves to the last real page before it so the brief excerpt
+    and question lookup stay right. Compositing the ink onto that borrowed page
+    would show working scrawled across unrelated printed text - which is what
+    the agent would then try to mark."""
     doc = pymupdf.open(pdf_path)
     page = doc[page_idx]
     pw, ph = page.rect.width, page.rect.height
@@ -869,8 +878,13 @@ def render(pdf_path, page_idx, strokes, crop=None, zoom=2.4):
     def tf(x, y):
         return (s * x + pw / 2.0, s * y)
 
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
-    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("RGB")
+    if blank:
+        # round(), not int(): pymupdf rounds its pixmap dimensions, and the crop
+        # box is clamped against the image size, so the two must agree exactly
+        img = Image.new("RGB", (round(pw * zoom), round(ph * zoom)), (255, 255, 255))
+    else:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("RGB")
     d = ImageDraw.Draw(img)
     for cname, pts in strokes:
         xy = [(tf(x, y)[0] * zoom, tf(x, y)[1] * zoom) for x, y in pts]
@@ -2508,7 +2522,9 @@ def handle(rel, state, dry=False):
         lane (sessions and sess_n are per-lane; `answered` is a list append,
         which is atomic)."""
         jid = g["_jid"]
-        full, crop = render(pdf_path, idx, strokes, crop=g["bbox"])
+        # on_notes -> blank sheet: an inserted page has no PDF behind it
+        full, crop = render(pdf_path, idx, strokes, crop=g["bbox"],
+                            blank=on_notes)
         # the trigger hash goes into the filename: resumed conversations have
         # earlier captures in context, and a REUSED path would let the model
         # "transcribe" the old image from memory instead of re-reading it
@@ -2553,7 +2569,13 @@ def handle(rel, state, dry=False):
             state["answered"].append(g["hash"])
             return "done"
 
-        ptext = page_text(pdf_path, idx)
+        # A notes page has no printed text of its own. Handing it the
+        # borrowed page's text would have the agent mark against content
+        # that is not in front of them.
+        ptext = ("(This is a blank notes page inserted after page %d of the\n"
+                 "workbook. It has no printed content - everything on it is\n"
+                 "their own handwriting.)" % idx) if on_notes \
+            else page_text(pdf_path, idx)
         ctx = {"module": module, "exam": exam, "workbook": key, "pageno": idx + 1,
                "colour": g["colour"].lower(), "action": g["kind"],
                "kind": g["kind"], "image": (crop_png or full_png),
