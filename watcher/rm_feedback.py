@@ -445,7 +445,7 @@ OPTIONAL_RANGE_RE = re.compile(
     r"(?i)optional drills?\s+D(\d{1,2})\s*[–—-]\s*D?(\d{1,2})")
 
 
-def drill_list(pdf_path):
+def drill_list(pdf_path, with_pages=False):
     """Countable item labels (D3, E1, ...) in the workbook. Deterministic and
     cheap - this is the progress bar's denominator. An item is dropped only if
     it is named in an explicit "optional drills D11-D13" note, or if EVERY page
@@ -485,8 +485,24 @@ def drill_list(pdf_path):
                 excluded.add(lab)
     except Exception:
         pass
-    keep = [l for l in pages_of if l not in excluded]
-    return sorted(keep, key=lambda l: (l[0], int(l[1:])))
+    keep = sorted([l for l in pages_of if l not in excluded],
+                  key=lambda l: (l[0], int(l[1:])))
+    if not with_pages:
+        return keep
+    # Where each drill is actually PRINTED, for marking work done on a
+    # different page. A contents or agenda page lists nearly every label, so
+    # pages naming more than a handful are skipped as indexes rather than
+    # homes; the earliest remaining page wins.
+    dense = {i for i in set().union(*pages_of.values()) if
+             sum(1 for pg in pages_of.values() if i in pg) > 4} if pages_of else set()
+    # All of them, not just the first: a drill's question and its answer box
+    # are usually on facing pages, and the marker wants both.
+    home = {}
+    for lab in keep:
+        cands = sorted(p for p in pages_of[lab] if p not in dense)
+        if cands:
+            home[lab] = cands[:3]
+    return keep, home
 
 
 # Progress is DRILL-based and lives in a human-readable checklist per workbook:
@@ -1808,6 +1824,30 @@ single word ILLEGIBLE.
 """
 
 
+REF_PROMPT = u"""Look at this image: {png}
+
+It shows handwriting. Somewhere in it there may be a QUESTION REFERENCE - a
+drill or exercise label such as D5, D12, E2, or "Q3", written to say which
+question the work answers.
+
+Output ONLY that label, normalised (D5, E2, Q3). If there is no such reference,
+output the single word NONE. No other words."""
+
+
+def find_ref(png):
+    """-> "D5" / "E2" / None. Used when work is written somewhere other than the
+    page holding the question: a label in red says which question it answers.
+    Read with the cheapest model - this is transcription, not judgement."""
+    try:
+        out = run_claude(REF_PROMPT.format(png=png), COMMAND_MODEL, COMMAND_EFFORT,
+                         tools="Read", timeout=90)
+    except Exception as e:
+        log("     ref lookup failed: %s" % str(e)[:60])
+        return None
+    m = re.search(r"\b([DE][1-9]\d?)\b", (out or "").upper())
+    return m.group(1) if m else None
+
+
 def classify(text):
     """Classify the transcribed command in code rather than asking the model to
     do it. Transcription is something models are reliable at; format compliance
@@ -1891,6 +1931,8 @@ FETCH A QUESTION IMAGE
 'screenshot q1 real' / 'q3 game theory' / 'q1 formative' - name the paper
 'screenshot from the exam paper' - infers the question from the page you're on
 'screenshot' alone + a grey circle - renders the circled region of THIS page
+red + a question number (D5) on any page - marks work written away from
+  the question, fetching that question from wherever it is printed
 a grey BOX around anything, no words needed - sends just that crop
 (sources and exact pages: workbooks/QUESTION-LOOKUP.md)
 
@@ -2576,6 +2618,36 @@ def handle(rel, state, dry=False):
                  "workbook. It has no printed content - everything on it is\n"
                  "their own handwriting.)" % idx) if on_notes \
             else page_text(pdf_path, idx)
+
+        # ---- answering away from the question ---------------------------
+        # Write the question number in red on a blank page (or any page that
+        # does not carry that question) and the marker fetches the question and
+        # its marking notes from wherever it actually lives. The extra lookup
+        # only runs when this page has no question of its own, so an ordinary
+        # mark on the question's own page pays nothing.
+        if g["kind"] == "mark" and (on_notes or
+                                    not re.search(r"\b[DE][1-9]\d?\b", ptext)):
+            lab = find_ref(crop_png or full_png)
+            if lab:
+                _all, home = drill_list(pdf_path, with_pages=True)
+                pgs = home.get(lab)
+                if pgs:
+                    qtext = "\n\n".join(page_text(pdf_path, q) for q in pgs)
+                    ptext = ("(The work being marked is written on a SEPARATE page - "
+                             "%s - and is labelled %s. The question it answers is "
+                             "printed on page%s %s of the workbook; that question and "
+                             "its surrounding text follow. Mark the handwriting in the "
+                             "image against this question.)\n\n%s"
+                             % ("a blank notes page" if on_notes
+                                else "page %d" % (idx + 1),
+                                lab, "" if len(pgs) == 1 else "s",
+                                ", ".join(str(q + 1) for q in pgs), qtext))
+                    log("     red ref %s -> question on pdf page(s) %s"
+                        % (lab, ", ".join(str(q + 1) for q in pgs)))
+                else:
+                    log("     red ref %s is not a drill in this workbook" % lab)
+            else:
+                log("     no question reference found in the red ink")
         ctx = {"module": module, "exam": exam, "workbook": key, "pageno": idx + 1,
                "colour": g["colour"].lower(), "action": g["kind"],
                "kind": g["kind"], "image": (crop_png or full_png),
