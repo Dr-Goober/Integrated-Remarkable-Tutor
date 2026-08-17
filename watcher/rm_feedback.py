@@ -2096,7 +2096,14 @@ def handle_command(crop_png, state, dry=False, page=None, doc=None):
     if kind == "crop":
         if not page:
             return "No page context - draw the box on a workbook page.", "crop failed"
-        state["_shots"] = page_shot(page[0], page[1], page[2], crop_only=True)
+        # An inserted notes page has no PDF behind it, so there are no
+        # "source pixels" to fetch - the only content is the ink, which has
+        # already been rendered onto a blank sheet. Re-rendering from the PDF
+        # would return the borrowed page instead of what was actually boxed.
+        if len(page) > 4 and page[4]:
+            state["_shots"] = [crop_png]
+        else:
+            state["_shots"] = page_shot(page[0], page[1], page[2], crop_only=True)
         # no prose - the crop IS the answer, and the dashboard opens it from the
         # card itself rather than expanding one, so the title is the instruction
         return "", "Click to open screenshot"
@@ -2135,7 +2142,10 @@ def handle_command(crop_png, state, dry=False, page=None, doc=None):
                        "\n".join("- " + n for n in names[:10]), q)), "Q%d not found" % q
         if not page:
             return "No page context - circle on a workbook page.", "screenshot failed"
-        shots = page_shot(page[0], page[1], page[2])
+        if len(page) > 4 and page[4]:      # notes page: ink is all there is
+            shots = [crop_png]
+        else:
+            shots = page_shot(page[0], page[1], page[2])
         state["_shots"] = shots
         return ("Sent %d render%s of the current page from its source PDF. To fetch "
                 "a question from an exam paper instead, write e.g. 'screenshot q12' "
@@ -2584,7 +2594,8 @@ def handle(rel, state, dry=False):
             t0 = time.time()
             try:
                 body, short = handle_command(crop_png or full_png, state, dry=dry,
-                                             page=(pdf_path, idx, g["bbox"], module),
+                                             page=(pdf_path, idx, g["bbox"],
+                                                   module, on_notes),
                                              doc=(doc_uuid, order, key, pdf_path,
                                                   brief_path))
             except Stopped:
