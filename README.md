@@ -6,7 +6,8 @@ Turn a reMarkable tablet into a handwriting-first AI study loop:
 
 - **Circle your handwritten work in RED** → it gets marked, strictly, against a real mark scheme, on your phone within ~30 s
 - **Circle anything in BLUE** → it gets explained differently than your notes explain it; blue *handwriting* is read as your question and answered directly
-- **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `tutor` (blue becomes a free-form question to a full tutor), `screenshot q12` (fetches that question's image from the source exam PDF), `status`, `restart`, `help`
+- **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `tutor` (blue becomes a free-form question to a full tutor), `screenshot q12` (fetches that question's image from the source exam PDF), `wait` … `begin` (hold your ink while writing a long prompt, then fire it all), `start timer 25` (a study countdown on the dashboard), `status`, `restart`, `help`
+- **A local dashboard** at `http://localhost:8477` mirrors the loop: live replies with rendered LaTeX, per-workbook and per-module progress bars, a session token/cost meter, a stop button that kills the in-flight agent, and study timers with a built-in break flow
 - You keep writing on paper-like e-ink the whole time. No app switching, no typing, no chat window.
 
 Built during a real two-exam sprint (and battle-tested on it). Everything here is the generalised version of that setup.
@@ -27,6 +28,7 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
 |---|---|
 | `SETUP.md` | One-time setup: tablet SSH, keys, phone notifications, Python. |
 | `rm_feedback.py` | The watcher — the whole live loop in one file. Read its docstring first. |
+| `rm_dashboard.html` | The local dashboard the watcher serves at `http://localhost:8477`: live feed, progress tracking, session stats, stop control, timers. |
 | `START-WATCHER.bat` / `.sh` | Double-click (Windows) / `sh` (Linux, macOS) launchers; both make grey `restart` work cleanly. |
 | `build_question_map.py` | Builds the question-location table the grey `screenshot qN` command fetches from. |
 | `capture.ps1` | Manual fallback: screenshots the reMarkable desktop app (works even when occluded) for ad-hoc "mark my screen" requests. |
@@ -56,9 +58,10 @@ Skills are standard Claude Code skills — drop any of them into `.claude/skills
 2. Set two environment variables (or edit the constants at the top of `rm_feedback.py`):
    - `RM_NTFY_TOPIC` — your ntfy topic. **Treat it as a password**: anyone who knows it can read your feedback. Use a long random string.
    - `RM_STUDY_ROOT` — the folder holding your module folders.
-3. Edit the `WORKBOOKS` map in `rm_feedback.py`: tablet document name → (source PDF, tutor brief). The shipped map is the author's — replace it.
+3. Edit the `WORKBOOKS` map (and `EXAM_DATES`) in `rm_feedback.py`: tablet document name → (source PDF, tutor brief). The shipped map is an example — replace it.
 4. Put the PDFs you study from on the tablet with the **same names** as in the map.
 5. Double-click `watcher/START-WATCHER.bat` (Windows) or run `sh watcher/START-WATCHER.sh` (Linux/macOS). Write, circle, keep working.
+6. Open `http://localhost:8477` on the watcher machine for the live dashboard.
 
 ## The four hard-won technical facts (so you don't rediscover them)
 
@@ -80,3 +83,7 @@ Marking one circled answer ≈ 20–40k tokens (page image + the relevant slice 
 ## Legal note
 
 This processes *your* course materials for *your* private study — keep it that way. Don't redistribute generated workbooks containing your university's figures or questions, and keep AI use inside your institution's rules (preparation ≠ exam-time assistance).
+
+---
+
+🐇
