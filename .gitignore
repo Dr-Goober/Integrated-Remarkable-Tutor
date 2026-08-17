@@ -4,6 +4,7 @@ __pycache__/
 .rm_feedback_tmp/
 .rm_memory/
 .rm_marks/
+.rm_pagemap/
 .rm_progress/
 rm_feedback.log
 page.png

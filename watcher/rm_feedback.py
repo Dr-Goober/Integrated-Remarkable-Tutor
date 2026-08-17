@@ -602,7 +602,8 @@ Output ONLY lines of the form "D3: complete" or "E2: complete" for items at
 full marks - no commentary, nothing else. If none qualify, output NONE."""
 
 
-def progress_scan(doc_uuid, order, wb_key, pdf_path, brief_path, state, dry=False):
+def progress_scan(doc_uuid, order, pdf_map, wb_key, pdf_path, brief_path,
+                  state, dry=False):
     """Grey 'update progress'. First run is the expensive one: renders every
     inked content page and has the marking model judge which drills are at
     full marks. Later runs re-audit the same way but keep already-ticked
@@ -639,8 +640,11 @@ def progress_scan(doc_uuid, order, wb_key, pdf_path, brief_path, state, dry=Fals
         try:
             local = os.path.join(WORK_DIR, order[i] + ".rm")
             pull("%s/%s.rm" % (doc_uuid, order[i]), local)
-            full, _ = render(pdf_path, i, parse_strokes(local), crop=None)
-            p = os.path.join(WORK_DIR, "prog_%s_p%d.png" % (wb_key, i + 1))
+            # tablet position -> PDF page: an inserted notes page would
+            # otherwise render the wrong page for every page after it
+            pidx, _ins = pdf_page_for(pdf_map, i)
+            full, _ = render(pdf_path, pidx, parse_strokes(local), crop=None)
+            p = os.path.join(WORK_DIR, "prog_%s_p%d.png" % (wb_key, pidx + 1))
             full.save(p)
             shots.append(p)
         except Exception as e:
@@ -677,12 +681,12 @@ def progress_scan_all(state, dry=False):
         uuids = sorted({x[:-9] for x in listing.split() if x.endswith(".metadata")})
         for u in uuids:
             try:
-                name, order = doc_info(u)
+                name, order, pmap = doc_info(u)
             except Exception:
                 continue
             k = lookup_key(name)
             if k and k not in on_tablet:
-                on_tablet[k] = (u, order)
+                on_tablet[k] = (u, order, pmap)
     except Exception as e:
         log("     tablet doc listing failed: %s" % str(e)[:80])
     lines = []
@@ -694,10 +698,11 @@ def progress_scan_all(state, dry=False):
             continue
         try:
             if wb in on_tablet:
-                u, order = on_tablet[wb]
+                u, order, pmap = on_tablet[wb]
+                save_pagemap(wb, order, pmap)
                 log("     progress: auditing %s" % wb)
-                info, _ = progress_scan(u, order, wb, pdf_path, brief_path,
-                                        state, dry=dry)
+                info, _ = progress_scan(u, order, pmap, wb, pdf_path,
+                                        brief_path, state, dry=dry)
             else:
                 drills, done = prog_load(wb)
                 if drills is None:
@@ -724,17 +729,76 @@ def progress_scan_all(state, dry=False):
 
 
 def doc_info(doc_uuid):
-    """visibleName and the page-uuid -> index ordering, read from the tablet."""
+    """-> (visibleName, page order, pdf_map).
+
+    pdf_map runs parallel to `order`: the index of the SOURCE PDF page each
+    tablet page shows, or None for a page inserted on the tablet (a notes page,
+    which has no PDF behind it).
+
+    This matters because a tablet page's position is NOT its PDF page number.
+    Insert one notes page and every page after it shifts by one; insert two and
+    it shifts by two. Marking then reads the wrong page and the tutor answers a
+    question that isn't the one circled. xochitl already records the true
+    mapping per page as `redir`, so nothing has to be inferred - a page with no
+    `redir` is an inserted one."""
     meta = json.loads(ssh("cat %s/%s.metadata" % (XOCHITL, doc_uuid)))
     content = json.loads(ssh("cat %s/%s.content" % (XOCHITL, doc_uuid)))
-    order = []
+    order, pdf_map = [], []
     pages = content.get("cPages", {}).get("pages")
     if pages:
-        order = [p.get("id") for p in pages
-                 if not p.get("deleted", {}).get("value")]
+        for p in pages:
+            if p.get("deleted", {}).get("value"):
+                continue
+            order.append(p.get("id"))
+            redir = p.get("redir")
+            pdf_map.append(redir.get("value") if isinstance(redir, dict) else None)
     elif isinstance(content.get("pages"), list):
+        # legacy format: no redirection data, so positions are the best we have
         order = content["pages"]
-    return meta.get("visibleName", "?"), order
+        pdf_map = list(range(len(order)))
+    return meta.get("visibleName", "?"), order, pdf_map
+
+
+# --------------------------------------------------------------------------- #
+# tablet page -> PDF page
+# --------------------------------------------------------------------------- #
+PAGEMAP_DIR = os.path.join(HERE, ".rm_pagemap")
+
+
+def save_pagemap(wb_key, order, pdf_map):
+    """Record the mapping so it is inspectable, and so a stale copy survives the
+    tablet going offline. Written on every read; cheap and always current."""
+    try:
+        os.makedirs(PAGEMAP_DIR, exist_ok=True)
+        inserted = [i for i, v in enumerate(pdf_map) if v is None]
+        data = {"updated": time.strftime("%Y-%m-%d %H:%M"),
+                "tablet_pages": len(order),
+                "pdf_pages": len([v for v in pdf_map if v is not None]),
+                "inserted_at_tablet_page": [i + 1 for i in inserted],
+                # 1-based on both sides, which is what the log and cards show
+                "tablet_to_pdf": {str(i + 1): (None if v is None else v + 1)
+                                  for i, v in enumerate(pdf_map)}}
+        with io.open(os.path.join(PAGEMAP_DIR, "%s.json" % wb_key),
+                     "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=1))
+    except Exception as e:
+        log("  !! could not save page map: %s" % e)
+
+
+def pdf_page_for(pdf_map, nb_idx):
+    """-> (pdf_idx, inserted). An inserted notes page has no PDF page of its
+    own, so it borrows the last real page before it - work continued onto a
+    notes page still belongs to the question it follows. Falls back to the
+    tablet position only when there is no mapping at all."""
+    if nb_idx >= len(pdf_map):
+        return nb_idx, False
+    v = pdf_map[nb_idx]
+    if v is not None:
+        return v, False
+    for j in range(nb_idx - 1, -1, -1):
+        if pdf_map[j] is not None:
+            return pdf_map[j], True
+    return 0, True
 
 
 # --------------------------------------------------------------------------- #
@@ -2363,7 +2427,7 @@ def handle(rel, state, dry=False):
     if not trg:
         return 0, 0
 
-    name, order = doc_info(doc_uuid)
+    name, order, pdf_map = doc_info(doc_uuid)
     key = lookup_key(name)
     if key is None:
         log("  page changed in '%s' - not a tracked workbook, ignoring" % name)
@@ -2374,7 +2438,17 @@ def handle(rel, state, dry=False):
     if not os.path.exists(pdf_path):
         log("  !! workbook pdf missing: %s" % pdf_path)
         return 0, 0          # config problem - retrying will not help
-    idx = order.index(page_uuid) if page_uuid in order else 0
+    # nb_idx is where the page sits ON THE TABLET; idx is the page it shows in
+    # the SOURCE PDF. They diverge as soon as a notes page is inserted, and
+    # everything downstream - render, page text, brief excerpt, crops, question
+    # lookup - must use the PDF page or it answers about the wrong question.
+    save_pagemap(key, order, pdf_map)
+    nb_idx = order.index(page_uuid) if page_uuid in order else 0
+    idx, on_notes = pdf_page_for(pdf_map, nb_idx)
+    if idx != nb_idx or on_notes:
+        log("  page map: tablet p.%d -> pdf p.%d%s (%d notes page(s) inserted)"
+            % (nb_idx + 1, idx + 1, " [notes page]" if on_notes else "",
+               len([v for v in pdf_map if v is None])))
     module = pdf_rel.split("/")[0]
     exam = EXAM_DATES.get(module, "not configured")
 
