@@ -1,0 +1,1532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Study Watcher</title>
+<style>
+  :root {
+    --bg: #faf9f6; --card: #ffffff; --text: #1c1c1a; --muted: #8a8a82;
+    --border: #e6e4dc; --accent: #4a7c59; --accent-soft: #eaf1ec;
+    --pin: #b8860b; --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --pulse: var(--accent);
+    --pulse-mark: #ff1e46; --pulse-explain: #0a84ff; --pulse-command: #c0c0c0;
+    --pulse-ok: #00d26a;
+    --mk-low: #d9483b; --mk-mid: #e8930c; --mk-full: #2f9e44;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "Roboto Mono", monospace;
+  }
+  /* dark mode = Monokai palette */
+  [data-theme="dark"] {
+    --bg: #272822; --card: #2d2e27; --text: #f8f8f2; --muted: #75715e;
+    --border: #49483e; --accent: #a6e22e; --accent-soft: #3a4222;
+    --pin: #e6db74; --shadow: 0 1px 3px rgba(0,0,0,.45);
+    --pulse-mark: #ff2d75; --pulse-explain: #66d9ef; --pulse-command: #f4f4f4;
+    --pulse-ok: #a6e22e;
+    --mk-low: #f92672; --mk-mid: #fd971f; --mk-full: #a6e22e;
+  }
+  /* the hidden theme. Full black, terminal green, CLI font. One click on
+     the theme button exits back to the previous theme. */
+  [data-theme="matrix"] {
+    --bg: #000000; --card: #000000; --text: #00ff41; --muted: #00a82d;
+    --border: #0f4020; --accent: #00ff41; --accent-soft: #04240f;
+    --pin: #00ff41; --shadow: 0 0 10px rgba(0,255,65,.12);
+    --pulse-ok: #00ff41;
+  }
+  [data-theme="matrix"] body { font-family: var(--mono); }
+  [data-theme="matrix"] .kind, [data-theme="matrix"] .chip {
+    text-shadow: 0 0 6px rgba(0,255,65,.5);
+  }
+  /* blinking terminal cursor on the empty feed, matrix mode only */
+  [data-theme="matrix"] .empty::after {
+    content: "\2588"; margin-left: 7px; color: var(--text);
+    animation: cursorBlink 1.05s steps(1) infinite;
+  }
+  @keyframes cursorBlink { 50% { opacity: 0; } }
+  /* digital rain canvas, spawned when a response lands in matrix mode.
+     z-order: above all page chrome (header 5, hline 6, chipInfo 15) but
+     BELOW the feed (main, 35) so digits fall behind the response cards;
+     the tracker (40) stays above everything as before */
+  #rain { position: fixed; inset: 0; z-index: 30; pointer-events: none; }
+  main { position: relative; z-index: 35; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    transition: background .25s, color .25s;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 18px; background: var(--bg);
+    border-bottom: 2px solid var(--border);
+  }
+  #themeBtn {
+    position: fixed; left: 14px; bottom: 14px; z-index: 50;
+    border: none; background: none; color: var(--muted);
+    width: 32px; height: 32px; cursor: pointer; font-size: 17px;
+  }
+  #themeBtn:hover { color: var(--text); }
+  /* matrix-only rain switch beside the theme button: 1 = rain on, 0 = off */
+  #rainBtn {
+    position: fixed; left: 52px; bottom: 14px; z-index: 50;
+    border: none; background: none; color: var(--muted);
+    width: 32px; height: 32px; cursor: pointer; padding: 0;
+    font: 800 17px/1 var(--mono); display: none;
+  }
+  [data-theme="matrix"] #rainBtn { display: block; }
+  #rainBtn:hover { color: var(--text); }
+  #stopBtn {
+    border: 2px solid #c0392b; background: var(--card); color: #c0392b;
+    border-radius: 5px; width: 32px; height: 32px; cursor: pointer;
+    font: 800 17px/1 var(--mono); padding: 0;
+  }
+  #stopBtn:hover { box-shadow: 0 0 8px 1px rgba(255,0,0,.6); }
+  /* on click the button itself surges to full red as it spawns the pulse */
+  #stopBtn.fired { animation: stopFire .8s ease; }
+  @keyframes stopFire {
+    15% { border-color: rgb(255,0,0); color: rgb(255,0,0);
+          box-shadow: 0 0 14px 3px rgba(255,0,0,.85); }
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #c0392b;
+         display: inline-block; transition: background .3s; }
+  .dot.on { background: #2ecc71; }
+  #conn { display: flex; align-items: center; gap: 7px; color: var(--muted);
+          font-size: 13px; cursor: pointer; user-select: none; }
+  #chips { display: flex; gap: 8px; margin-left: 4px; }
+  .chip {
+    padding: 3px 12px; border: 2px solid var(--border); border-radius: 6px;
+    font-family: var(--mono); font-size: 12px; letter-spacing: .09em;
+    color: var(--muted); background: var(--card);
+    cursor: pointer; user-select: none;
+  }
+  /* info boxes STACK on the left in click order - click the same button
+     again to remove its box. Below 1150px they flow above the feed */
+  #chipInfo { display: none; }
+  @media (min-width: 1150px) {
+    #chipInfo { position: fixed; left: 16px; top: 70px; width: 300px; z-index: 15;
+                max-height: calc(100vh - 140px); overflow-y: auto; }
+  }
+  @media (max-width: 1149.9px) {
+    #chipInfo { max-width: 780px; margin: 14px auto 0; }
+  }
+  .infoBox {
+    background: var(--card); border: 2px solid var(--border); border-radius: 6px;
+    border-left-width: 4px; box-shadow: var(--shadow); font-size: 14px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .infoBox h3 { font-size: 13px; letter-spacing: .06em; margin-bottom: 6px;
+                font-family: var(--mono); }
+  .infoBox p { margin: 6px 0; }
+  /* each box wears its channel on the left edge and its heading */
+  .infoBox.b-mark    { border-left-color: #e03131; }
+  .infoBox.b-explain { border-left-color: #2e6bff; }
+  .infoBox.b-command { border-left-color: #8a8a86; }
+  .infoBox.b-session { border-left-color: var(--accent); }
+  .b-mark h3    { color: #e03131; }
+  .b-explain h3 { color: #2e6bff; }
+  .b-command h3 { color: #8a8a86; }
+  .b-session h3 { color: var(--accent); }
+  [data-theme="dark"] .infoBox.b-mark    { border-left-color: #f92672; }
+  [data-theme="dark"] .infoBox.b-explain { border-left-color: #66d9ef; }
+  [data-theme="dark"] .infoBox.b-command { border-left-color: #a59f85; }
+  [data-theme="dark"] .b-mark h3    { color: #f92672; }
+  [data-theme="dark"] .b-explain h3 { color: #66d9ef; }
+  [data-theme="dark"] .b-command h3 { color: #a59f85; }
+  /* coloured ink words inside the box text */
+  .inkR { color: #e03131; font-weight: 700; }
+  .inkB { color: #2e6bff; font-weight: 700; }
+  .inkG { color: #8a8a86; font-weight: 700; }
+  [data-theme="dark"] .inkR { color: #f92672; }
+  [data-theme="dark"] .inkB { color: #66d9ef; }
+  [data-theme="dark"] .inkG { color: #a59f85; }
+  .modeTag { display: inline-block; padding: 1px 7px; border-radius: 4px;
+             font-family: var(--mono); font-size: 11px; margin-left: 5px;
+             background: var(--accent-soft); color: var(--accent); }
+  .modelLine { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+  .cmdItem {
+    display: inline-block; margin: 3px 6px 3px 0; padding: 2px 9px;
+    border: 1px solid var(--border); border-radius: 4px; cursor: help;
+    font-family: var(--mono); font-size: 12px;
+  }
+  /* chips wear pastel ink colours at rest, fluorescent + blinking when busy */
+  #chip-mark    { color: #d98f8f; border-color: #ecc7c7; }
+  #chip-explain { color: #92a7dd; border-color: #c6d1ee; }
+  #chip-command { color: #a8a8a4; border-color: #d8d8d3; }
+  [data-theme="dark"] #chip-mark    { color: #c95f88; border-color: #5c2f42; }
+  [data-theme="dark"] #chip-explain { color: #6fb3c4; border-color: #2f545e; }
+  [data-theme="dark"] #chip-command { color: #a59f85; border-color: #49483e; }
+  .chip.busy { animation: blink .9s ease-in-out infinite; font-weight: 700; }
+  @keyframes blink { 50% { opacity: .3; } }
+  #chip-mark.busy    { color: #ff2e2e; border-color: #ff2e2e;
+                       background: rgba(255,46,46,.09); box-shadow: 0 0 9px rgba(255,46,46,.55); }
+  #chip-explain.busy { color: #2e6bff; border-color: #2e6bff;
+                       background: rgba(46,107,255,.09); box-shadow: 0 0 9px rgba(46,107,255,.55); }
+  #chip-command.busy { color: #b9b9b9; border-color: #b9b9b9;
+                       background: rgba(185,185,185,.12); box-shadow: 0 0 9px rgba(185,185,185,.5); }
+  [data-theme="dark"] #chip-mark.busy    { color: #f92672; border-color: #f92672; }
+  [data-theme="dark"] #chip-explain.busy { color: #66d9ef; border-color: #66d9ef; }
+  [data-theme="dark"] #chip-command.busy { color: #d6d6d6; border-color: #d6d6d6; }
+  #wbBox { margin-left: auto; min-width: 220px; max-width: 360px; flex: 1;
+           position: relative; cursor: pointer; }
+  .modRow { margin-top: 8px; }
+  .modName { display: flex; justify-content: space-between;
+             font-size: 12.5px; color: var(--text); }
+  .modName span:last-child { color: var(--muted); }
+  .modBarO { height: 6px; border-radius: 2px; background: var(--border);
+             margin-top: 4px; overflow: hidden; }
+  .modBarI { height: 100%; border-radius: 2px; transition: width .6s ease; }
+  #wbName { font-size: 12.5px; color: var(--muted); display: flex;
+            justify-content: space-between; transition: opacity .25s ease; }
+  /* while the study tracker covers this corner its text would show through
+     the gap - fade it out, fade back in when the tracker closes */
+  #wbBox.trkOpen #wbName { opacity: 0; }
+  #barOuter { height: 7px; border-radius: 2px; background: var(--border); margin-top: 4px; overflow: hidden; }
+  #barInner { height: 100%; width: 0%; background: var(--accent); border-radius: 2px;
+              transition: width .6s ease; }
+  /* study tracker — right sidebar, opened by clicking the progress bar */
+  #tracker {
+    position: fixed; top: 0; right: 0; height: 100%; width: 320px; max-width: 85vw;
+    background: var(--card); border-left: 2px solid var(--border);
+    box-shadow: -4px 0 16px rgba(0,0,0,.15); z-index: 40;
+    transform: translateX(105%); transition: transform .25s ease;
+    padding: 16px 18px; overflow-y: auto;
+  }
+  #tracker.open { transform: translateX(0); }
+  #trkHead { display: flex; justify-content: space-between; align-items: center;
+             font-family: var(--mono); font-size: 13px; letter-spacing: .12em;
+             color: var(--muted); margin-bottom: 16px; }
+  #trkClose { border: 2px solid var(--border); background: var(--card); color: var(--text);
+              border-radius: 5px; width: 26px; height: 26px; cursor: pointer;
+              font-size: 14px; line-height: 1; }
+  .trkMod { margin-bottom: 26px; }
+  .trkModHead { display: flex; justify-content: space-between; align-items: baseline;
+                margin-bottom: 4px; }
+  .trkModName { font-family: var(--mono); font-size: 15px; font-weight: 700;
+                letter-spacing: .06em; }
+  .trkModPct { font-family: var(--mono); font-size: 22px; font-weight: 700; }
+  .modBarO.big { height: 10px; }
+  .trkWb { margin-top: 10px; }
+  main { max-width: 780px; margin: 22px auto 80px; padding: 0 16px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 12vh; font-size: 14px; }
+  .card {
+    background: var(--card); border: 2px solid var(--border); border-radius: 6px;
+    margin-bottom: 10px; box-shadow: var(--shadow); overflow: hidden;
+    transition: border-color .3s;
+  }
+  .card.open.focus { border-color: var(--accent); }
+  /* OPEN cards wear their channel/score on the border: explain (and deep)
+     blue, command grey, mark by score (<50% red, >=50% orange, 100% green).
+     MINIMISED cards keep the plain border - the channel lives on the kind
+     label instead, and the title greys down to match the meta text. */
+  .card.open.kind-explain { border-color: #5d8bff; }
+  .card.open.kind-command { border-color: #a8a8a4; }
+  [data-theme="dark"] .card.open.kind-explain { border-color: #66d9ef; }
+  [data-theme="dark"] .card.open.kind-command { border-color: #75715e; }
+  .card.open.mark-low  { border-color: var(--mk-low); }
+  .card.open.mark-mid  { border-color: var(--mk-mid); }
+  .card.open.mark-full { border-color: var(--mk-full); }
+  .card.kind-mark .kind    { background: rgba(255,46,46,.10); color: #e03131; }
+  .card.kind-explain .kind { background: rgba(46,107,255,.10); color: #2e6bff; }
+  .card.kind-command .kind { background: rgba(140,140,140,.14); color: #7f7f7a; }
+  [data-theme="dark"] .card.kind-mark .kind    { background: rgba(249,38,114,.14); color: #f92672; }
+  [data-theme="dark"] .card.kind-explain .kind { background: rgba(102,217,239,.12); color: #66d9ef; }
+  [data-theme="dark"] .card.kind-command .kind { background: rgba(165,159,133,.15); color: #a59f85; }
+  .card:not(.open) .titleTxt { color: var(--muted); }
+  .cardHead {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    cursor: pointer; user-select: none;
+  }
+  .kind {
+    font-size: 11px; letter-spacing: .08em; padding: 2px 8px; border-radius: 3px;
+    font-family: var(--mono); background: var(--accent-soft); color: var(--accent);
+    flex: none;
+  }
+  .meta { color: var(--muted); font-size: 12px; flex: none; }
+  .titleTxt { font-weight: 600; font-size: 14px; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .pinBtn {
+    border: none; background: none; cursor: pointer; font-size: 15px;
+    color: var(--muted); flex: none; padding: 2px 4px;
+  }
+  .pinBtn.pinned { color: var(--pin); }
+  .cardHead { position: relative; }
+  .menuBtn {
+    border: none; background: none; cursor: pointer; font-size: 16px;
+    color: var(--muted); flex: none; padding: 2px 6px; border-radius: 4px;
+  }
+  .menuBtn:hover { background: var(--border); }
+  .cardMenu {
+    display: none; position: absolute; right: 6px; top: calc(100% - 4px);
+    z-index: 30; min-width: 130px; padding: 4px;
+    background: var(--card); border: 2px solid var(--border);
+    border-radius: 5px; box-shadow: var(--shadow);
+  }
+  .cardMenu.open { display: block; }
+  .mi { padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  .mi:hover { background: var(--accent-soft); }
+  .mi.del:hover { background: rgba(255,46,46,.12); color: #d33; }
+  .cardBody { padding: 2px 16px 14px; display: none; }
+  .card.open .cardBody { display: block; }
+  .card.open .titleTxt { white-space: normal; }
+  .bodyTxt { white-space: pre-wrap; font-size: 14.5px; }
+  .cardBody img { max-width: 100%; border: 2px solid var(--border);
+                  border-radius: 5px; margin-top: 10px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin: 30px 0; }
+  /* one-shot pulse in the arriving response's channel colour; the header
+     chips keep their own colours so they are excluded. --pd is a per-element
+     delay set from its distance to the source chip, so the flash travels
+     outward like a wave */
+  @keyframes pulseOnce {
+    35% { box-shadow: 0 0 16px 4px var(--pulse); border-color: var(--pulse); }
+  }
+  /* STOP button ripple: red, across the chips, dot and progress bar - the
+     only wave left; everything else flashes the header line instead. A
+     longer, ease-in-out envelope makes neighbouring elements overlap so the
+     sweep reads as one fluid motion, not a row of pops */
+  @keyframes pulseSoft {
+    30% { box-shadow: 0 0 14px 3px var(--pulse);
+          border-color: var(--pulse); color: var(--pulse); }
+  }
+  body.pulsingTop .chip, body.pulsingTop .dot, body.pulsingTop #barOuter {
+    animation: pulseSoft 1.1s cubic-bezier(.4, 0, .2, 1) var(--pd, 0ms);
+  }
+  /* the wave physically bulges the progress bars as it passes over them
+     (after the rules above so bars get this animation instead) */
+  @keyframes pulseBar {
+    35% { box-shadow: 0 0 16px 4px var(--pulse); transform: scaleY(1.6); }
+  }
+  body.pulsingTop #barOuter {
+    animation: pulseBar 1.1s cubic-bezier(.4, 0, .2, 1) var(--pd, 0ms);
+  }
+  /* ...and a highlight SWEEPS along the bar as the circular wavefront crosses
+     it: --pd = when the circle first touches the bar, --pdur = time it takes
+     to cross to the far end, --rev flips the sweep when the circle arrives
+     from the right. All three are set per-bar by waveFrom(). */
+  /* the pulse also runs along the header's bottom line: two segments spread
+     in OPPOSITE directions from the origin's x (so it flows left as well as
+     right), inside a thin clipped strip overlaying the border */
+  #hline {
+    position: fixed; left: 0; right: 0; top: calc(var(--hy, 52px) - 8px);
+    height: 16px; pointer-events: none; overflow: hidden; z-index: 6;
+  }
+  #hline::before, #hline::after {
+    content: none; position: absolute; top: 7px; height: 2px; width: 90px;
+    left: calc(var(--hx, 50vw) - 45px);
+    background: linear-gradient(90deg, transparent, var(--pulse), transparent);
+    box-shadow: 0 0 8px 1px var(--pulse);
+  }
+  body.pulsingTop #hline::before {
+    content: ""; animation: hSweepL var(--hdl, 800ms) linear var(--hpd, 0ms) both;
+  }
+  body.pulsingTop #hline::after {
+    content: ""; animation: hSweepR var(--hdr, 800ms) linear var(--hpd, 0ms) both;
+  }
+  @keyframes hSweepL { to { transform: translateX(calc(-1 * var(--hxl, 100vw))); } }
+  @keyframes hSweepR { to { transform: translateX(var(--hxr, 100vw)); } }
+  /* response landed / tablet back: the ENTIRE header line flashes in the
+     landed colour - quick fade in, slow taper out */
+  #hflash {
+    position: absolute; left: 0; right: 0; top: 7px; height: 2px;
+    background: var(--pulse); box-shadow: 0 0 10px 2px var(--pulse);
+    opacity: 0;
+  }
+  #hflash.on { animation: lineFlash 1.6s ease; }
+  @keyframes lineFlash { 12% { opacity: 1; } 100% { opacity: 0; } }
+  /* ---- top-centre clock + stopwatch countdown (all themes) ---- */
+  #clockBox {
+    position: fixed; top: 9px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 6px; z-index: 60;
+    font-family: var(--mono);
+  }
+  #clockTime { font-size: 15px; font-weight: 700; color: var(--text);
+               letter-spacing: .08em; }
+  #clockTime.counting { cursor: pointer; color: var(--accent); }
+  #swBtn { border: none; background: none; color: var(--muted); cursor: pointer;
+           font-size: 15px; padding: 0 2px; }
+  #swBtn:hover { color: var(--text); }
+  /* preset minutes slide rightward out from under the stopwatch */
+  #swOpts { display: inline-flex; gap: 5px; max-width: 0; opacity: 0;
+            overflow: hidden; transition: max-width .35s ease, opacity .25s; }
+  #swOpts.open { max-width: 220px; opacity: 1; }
+  .swN {
+    border: 2px solid var(--border); background: var(--card); color: var(--muted);
+    border-radius: 5px; cursor: pointer; font: 700 12px/1 var(--mono);
+    padding: 4px 6px; transform: translateX(-140%);
+    transition: transform .35s ease;
+  }
+  #swOpts.open .swN { transform: translateX(0); }
+  #swOpts.open .swN:nth-child(2) { transition-delay: .05s; }
+  #swOpts.open .swN:nth-child(3) { transition-delay: .1s; }
+  #swOpts.open .swN:nth-child(4) { transition-delay: .15s; }
+  .swN:hover { color: var(--text); border-color: var(--accent); }
+  /* paused-countdown controls: resume + skip-to-decision */
+  #swCtl { display: none; gap: 3px; }
+  #swCtl.on { display: inline-flex; }
+  .swC { border: none; background: none; cursor: pointer; color: var(--muted);
+         font: 700 14px/1 var(--mono); padding: 0 3px; }
+  .swC:hover { color: var(--text); }
+  #swSkip:hover { color: #e03131; }
+  /* time's up (matrix): the pills are DRAWN on the canvas out of red/blue
+     digits - these buttons are just invisible click targets over them */
+  .pill {
+    display: none; position: fixed; width: 110px; height: 60px;
+    background: none; border: none; cursor: pointer; z-index: 96; padding: 0;
+  }
+  body.choosing .pill { display: block; }
+  .pillMsg {
+    display: none; position: fixed; z-index: 96; transform: translateX(-50%);
+    background: rgba(0,0,0,.85); border: 1px solid #0f4020; border-radius: 4px;
+    color: #00ff41; font: 12px var(--mono); padding: 5px 9px;
+    text-align: center; white-space: nowrap;
+  }
+  .pillMsg.on { display: block; animation: msgIn .7s ease forwards; }
+  @keyframes msgIn { from { opacity: 0; } to { opacity: 1; } }
+  #choiceBox {
+    display: none; position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%); z-index: 96; text-align: center;
+    background: var(--card); border: 2px solid var(--border); border-radius: 6px;
+    box-shadow: var(--shadow); padding: 22px 26px; font-family: var(--mono);
+  }
+  #choiceBox.on { display: block; }
+  #choiceBox .cb { margin: 12px 6px 0; padding: 8px 16px; cursor: pointer;
+    border: 2px solid var(--border); border-radius: 5px;
+    background: var(--card); color: var(--text); font: 700 13px var(--mono); }
+  #choiceBox .cb:hover { border-color: var(--accent); }
+  /* pill choice screen: the settling rain draws IN FRONT of the responses
+     (deposit canvas + moving-heads canvas), pills sit above both */
+  #pillRain, #pillHeads { position: fixed; inset: 0; z-index: 90;
+                          pointer-events: none; }
+  #pillHeads { z-index: 91; }
+  /* messages to Neo: no box - typed straight onto the page, with a subtle
+     dark edge so they hold up on white. Film-style two-height caps. */
+  #neoBox {
+    display: none; position: fixed; right: 18px; bottom: 18px; z-index: 85;
+    width: 300px;   /* fixed width: the left edge stays put, so the text
+                       types left-to-right instead of pushing outward */
+    text-align: left; color: #00c93f;
+    font: 14px/1.7 "Courier New", Courier, monospace;
+    font-variant: small-caps; letter-spacing: .06em; font-weight: 700;
+    text-shadow: 0 0 2px rgba(0,0,0,.55), 0 1px 1px rgba(0,0,0,.35);
+  }
+  #neoBox.on { display: block; }
+  #neoBox div::after { content: "\2588"; margin-left: 4px;
+                       animation: cursorBlink 1.05s steps(1) infinite; }
+  #neoBox div:not(:last-child)::after { content: none; }
+  /* an original greyscale run-cycle sprite, 6 frames of 64x48, facing right */
+  #rabbit {
+    position: fixed; bottom: 4px; z-index: 97; width: 64px; height: 48px;
+    cursor: pointer; user-select: none;
+    background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAYAAAAAwCAYAAAAYeq1+AAAGLUlEQVR4nO2dQZLrKAyG1VNzpz5O9ln4ML3w3sfJqTKLFO8xtMGAhfSD9FV1VTrVDUiIXwLHzheBs+/7+/l8fmmPQ4t9399n76/qk5y9RB+brfgjjnsrNhPZsrWElO7BOdUD4INVAQiUbF7RH574/mLJ1oCWzZAO9QD4P9YEIFDySY7Z/WEt8cV40SNvM5QzrQcAkW0ByNGaCGb3h5XE50XPB03dU3WkB8A5VgSglRa/rOAPK4nPWtGDpHsQTrQWALVYEYAWrCUBIhs2Wyx6EHQPxoEWA6AWCwLQylUVJTkWCazEgLWiR1v34JxnLQBqsSIALVjcHVpJfNbiXUv3YB1nLQBqsSIAV9TEx6r+sJL4LGqAtM3QTrMYADVYEYAcluPCYuKzVvRIxvcUzrMWACUsCkDMlf0/Pz9ERLRt25/3VvGHJ77frGZnjITu/cPRyGhWnuQWagWg58LSDNSKf/p6BX/U2L6azYGSLfu+v1eyNUZC96ZIAFYDIMayAFjHEx/f382EhO7BJwDLARCwLAAtxMc+8Wsie75YActFj5TuQScAywHg9LFt2y/xD6waHysmPstFj6TuwSYAywHQyooC4LRhMfGtiLTu/dvzTw4eucVPpPedCtx3OZZukb/btjMX27adfuKLyL9DpAVYJ9Us9FwAEK212DkquDv+SPs/a2tklZn2p337fAtcH920lvi0Y14Lad2DddAqATC7AFx9/lryeCG2Q+N+COlEOHPii+mZq1XWfyvSdos4aJUAsCYAqGfHV4lgxMLveXIjJy0JF0H4OAqWlXY9tTd1LZMAVgsAiwKAmgCIZBc4ih80El+OXDHEXQDNuush6i/YJHWP/Vx4xQCwKgAodueQWuhIfkAQN+ljP+RdzwgdlNS9LqdZCwCrAoBkdw4Jf6D5QTMJaPiiJKrWfJEi/jA4iwGAMNExngT+YnH+iXAqXikQdj4xUn7IFcBq3wdgMQCsC0Ct/a/Xi4iIvr+/h44nxuIxEJG9BECElQQkE8DI9mHvBE7xwNPj+Xx+hZ/c3wTxT1+PHpdIR5V9vV4vMdsdG4zWvWkSgDYuAB9SP+RsvuOH0GapDY2kXEqEkglQsyCxXgytRnMCsBwALgAfagT6Ttul34n07U/HIJkA0WyPsVAABRDmgQPWm4RGnwGjOT34IBf0vX6I20vbkPTB4/F4ExEdx/EVXtfCYXvKcRxQ80/0iQHO+T9rK7SDFv9E+TUwQgOQ7Scap38j7b7dsPUAKAnjzALQKvgpIxJACc3kkPMV5/wjxn6A036i8wII2X6i3z7g1D/oBEBkMwCuBJJTAKUFoFf8UxHuvZmFq38JRsZ+DOLuJzA6ASLbTjQ2BkbbDpcA0AOgVpxmFIAe4UUcVxhT/H8jxpkbV9xXz8MAa9pF42zMK67/MzhPAaTt9+8DqKBFgMJkHcdBRHwC8Hg83tyBMEulnfZ3NW4J/9X6rmfnlrvmEl+TaW3TGUfPNTIUhu0AOCtgxPPdMyQEmquP3qoaCS0bSv1KJZlZ5sPKLoCI5yRE2vbbDXOffxHhBECtwIwc24jjAM2kNprRoiktyldzhTQ/uYKl51leaVtIdubg0MKza2DTJYCei4GIAYCy+LiTQE0CmGHBXcF9DUCzIp9hN8C9Y0XQgFZ6koCm9t26BjDyHFQbFPEPfXGeMZbam2GR1bKaLbOeMzu4Gtj9KIiVBeSq2kKx8Y4gpDYg2YWKtn9y/aMkhrPxccYoip0l0OcopSsBaBiD4EBNASgFVvjpadOFfy6u4kB6POkYVuhjFAhzlML+MDg0A1soTRCCSF6NYWbfzwJ6HCCKDNp4RnNnnUr7qisB1Bg426TPMl6v2DGRjh/EYmC2xDQSxPk5o3sHUCNCPUbmAkXjo5YSffeCOCZHFsRiYLTwodlbonWsGknh1hFQTQC2GIV4/IIccGcXcrXG4uiBNu9cmoBSJd8hp5Hxe5pHz1B3LWomAOldhzM3iJ9RH/3so1bu7KxXXI9nj/LQLnqH37nYYoj2pPuzVpwWPF7q6BE5bS2QQttO9k8BxYNvNUT7SAPxTNXBxeOljqsjEEcPnwTHcURo3TGhHWmNwoqdjuM4DhD/Ae3bgY0U1y71AAAAAElFTkSuQmCC) 0 0 no-repeat;
+  }
+  #swamp { position: fixed; inset: 0; z-index: 99; pointer-events: none; }
+  /* break mode: a huge countdown cell over most of the screen */
+  #breakBox {
+    display: none; position: fixed; inset: 6vh 6vw; z-index: 95;
+    background: var(--card); border: 2px solid var(--border); border-radius: 6px;
+    box-shadow: var(--shadow); cursor: pointer;
+    flex-direction: column; align-items: center; justify-content: center;
+  }
+  #breakBox.on { display: flex; }
+  #breakTime { font: 700 16vw/1 var(--mono); color: var(--accent);
+               letter-spacing: .04em; }
+  #breakHint { color: var(--muted); font-size: 13px; margin-top: 14px; }
+  #barOuter, .modBarO { position: relative; }
+  @keyframes barSweep { from { left: -45%; } to { left: 100%; } }
+  body.pulsingTop #barOuter::after {
+    content: ""; position: absolute; top: 0; bottom: 0; left: -45%; width: 45%;
+    background: linear-gradient(90deg, transparent, var(--pulse), transparent);
+    animation: barSweep var(--pdur, 400ms) linear var(--pd, 0ms) both;
+    animation-direction: var(--rev, normal);
+  }
+  .bodyTxt .katex-display { overflow-x: auto; padding: 4px 0; }
+  .katex { font-size: 1.06em; }
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+</head>
+<body>
+<header>
+  <span id="conn"><span class="dot" id="dot"></span><span id="connTxt">connecting…</span></span>
+  <button id="stopBtn" title="stop the current agent and ignore its prompt">!</button>
+  <div id="chips">
+    <span class="chip" id="chip-mark">MARK</span>
+    <span class="chip" id="chip-explain">EXPLAIN</span>
+    <span class="chip" id="chip-command">COMMAND</span>
+  </div>
+  <div id="wbBox" title="open study tracker">
+    <div id="wbName"><span id="wbTxt">no workbook active</span><span id="pctTxt"></span></div>
+    <div id="barOuter"><div id="barInner"></div></div>
+  </div>
+</header>
+<div id="hline"><div id="hflash"></div></div>
+<div id="clockBox">
+  <span id="clockTime">--:--:--</span>
+  <span id="swCtl">
+    <button class="swC" id="swPlay" title="resume">&#9654;</button>
+    <button class="swC" id="swSkip" title="skip to the decision">&#10005;</button>
+  </span>
+  <button id="swBtn" title="set a countdown">&#9201;</button>
+  <span id="swOpts">
+    <button class="swN">15</button><button class="swN">30</button>
+    <button class="swN">45</button><button class="swN">60</button>
+  </span>
+</div>
+<button id="pillRed" class="pill" title="Escape the Matrix: take a 15 minute break"></button>
+<button id="pillBlue" class="pill" title="Stay in the Matrix: keep working"></button>
+<div class="pillMsg" id="pillMsgRed">Escape the Matrix:<br>Take a 15 minute break</div>
+<div class="pillMsg" id="pillMsgBlue">Stay in the Matrix:<br>Keep Working</div>
+<div id="choiceBox"><div>Time's up.</div>
+  <button class="cb" id="cbCont">CONTINUE</button>
+  <button class="cb" id="cbBreak">START BREAK</button></div>
+<div id="breakBox"><div id="breakTime">15:00</div>
+  <div id="breakHint">break — click anywhere on this card to end early</div></div>
+<div id="neoBox"></div>
+<div id="chipInfo"></div>
+<aside id="tracker">
+  <div id="trkHead"><span>STUDY TRACKER</span>
+    <button id="trkClose" title="close">&times;</button></div>
+  <div id="trkBody"><div class="modRow modName">no module data yet</div></div>
+</aside>
+<main id="feed"><div class="empty">Waiting for Questions....</div></main>
+<footer>Don't know what to do? Write&nbsp;<b>"guide"</b>&nbsp;in grey</footer>
+<button id="themeBtn" title="light/dark">&#9681;</button>
+<button id="rainBtn" title="digital rain on response: 1 = on, 0 = off">1</button>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+/* ---------- theme ---------- */
+const root = document.documentElement;
+function setTheme(t) { root.dataset.theme = t; localStorage.rmTheme = t; }
+// the page never OPENS in matrix - a stored matrix theme falls back
+let initTheme = localStorage.rmTheme;
+if (initTheme === "matrix") initTheme = localStorage.rmPrevTheme || "dark";
+setTheme(initTheme ||
+         (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+$("themeBtn").onclick = () => {
+  const t = root.dataset.theme;
+  if (window.matrixUnlocked) {
+    // the rabbit was clicked this session: cycle all three themes
+    const order = ["light", "dark", "matrix"];
+    const next = order[(order.indexOf(t) + 1) % order.length];
+    if (next === "matrix") localStorage.rmPrevTheme = t;
+    setTheme(next);
+  } else if (t === "matrix") {
+    setTheme(localStorage.rmPrevTheme || "dark");
+  } else {
+    setTheme(t === "dark" ? "light" : "dark");
+  }
+  renderedKey = "";       // rebuild the feed so card images (de)matrixify
+};
+
+/* ---------- card focus / pin state ---------- */
+let lastMax = 0, renderedKey = "";
+const expanded = new Set();
+const pinned = new Set(JSON.parse(localStorage.rmPins || "[]"));
+const savePins = () => localStorage.rmPins = JSON.stringify([...pinned]);
+
+const waveTimers = {};
+const WAVE_FRONT = 1.05;                     // wavefront speed, px per ms
+
+const centerOf = el => {
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+};
+
+function waveFrom(origin, sel, cls) {
+  // widget flashes, bar sweeps and the header-line runners, all timed to the
+  // same front speed: each element fires when the (invisible) wavefront
+  // first touches its bounding box.
+  for (const el of document.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect();
+    const dx = Math.max(r.left - origin.x, 0, origin.x - r.right);
+    const dy = Math.max(r.top - origin.y, 0, origin.y - r.bottom);
+    const d = Math.hypot(dx, dy);
+    el.style.setProperty("--pd",
+      Math.min(3000, Math.round(d / WAVE_FRONT)) + "ms");
+    if (el.matches("#barOuter, .modBarO")) {
+      const ym = (r.top + r.bottom) / 2;
+      const dl = Math.hypot(r.left - origin.x, ym - origin.y);
+      const dr = Math.hypot(r.right - origin.x, ym - origin.y);
+      el.style.setProperty("--pdur",
+        Math.max(250, Math.round(Math.abs(dl - dr) / WAVE_FRONT)) + "ms");
+      el.style.setProperty("--rev", dl <= dr ? "normal" : "reverse");
+    }
+  }
+  // the header's bottom line: two highlights spread in opposite directions
+  // from the origin's x, starting when the ring first reaches the line
+  const hb = document.querySelector("header").getBoundingClientRect().bottom;
+  const hl = $("hline");
+  hl.style.setProperty("--hy", Math.round(hb) + "px");
+  hl.style.setProperty("--hx", Math.round(origin.x) + "px");
+  hl.style.setProperty("--hpd",
+    Math.round(Math.abs(hb - origin.y) / WAVE_FRONT) + "ms");
+  const dR = innerWidth - origin.x + 90, dL = origin.x + 90;
+  hl.style.setProperty("--hxr", Math.round(dR) + "px");
+  hl.style.setProperty("--hdr", Math.round(dR / WAVE_FRONT) + "ms");
+  hl.style.setProperty("--hxl", Math.round(dL) + "px");
+  hl.style.setProperty("--hdl", Math.round(dL / WAVE_FRONT) + "ms");
+
+  document.body.classList.remove(cls);
+  void document.body.offsetWidth;          // restart the animation
+  document.body.classList.add(cls);
+  clearTimeout(waveTimers[cls]);
+  waveTimers[cls] = setTimeout(() => document.body.classList.remove(cls), 5600);
+}
+
+/* ---------- matrix digital rain ---------- */
+// A response landing in matrix mode floods the page with falling 1s and 0s.
+// One fixed canvas; each column steps cell-by-cell (accumulator, so speed is
+// frame-rate independent), drawing a bright head and re-painting the cell
+// above in body green. Trails fade by erasing the whole canvas toward
+// transparent each frame (destination-out), so the page stays visible
+// underneath. Streaks disappear the SAME WAY they appeared: 5 seconds after
+// a column began its descent, an eraser runner starts at that streak's top
+// and consumes it downward at the same cell rate it fell - so each streak is
+// swallowed top-first, individually, with no global fade of any kind.
+let rain = null;
+function startRain() {
+  const until = performance.now() + 3500;
+  if (rain) { rain.until = until; return; }      // already raining - extend
+  const FS = 16;                                 // cell size, css px
+  const ERASE_AFTER = 5000;                      // ms from descent start
+  const canvas = document.createElement("canvas");
+  canvas.id = "rain";
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.ceil(innerWidth * dpr);
+  canvas.height = Math.ceil(innerHeight * dpr);
+  canvas.style.width = innerWidth + "px";
+  canvas.style.height = innerHeight + "px";
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.textBaseline = "top";
+  const t0 = performance.now();
+  const spawn = (c, t) => {                      // one streak = one descent
+    c.row = -1 - Math.floor(Math.random() * (c.streaks.length ? 8 : 25));
+    c.v = 9 + Math.random() * 16;                // cells per second
+    c.cur = { born: t, v: c.v, maxRow: -1, erow: -1, eacc: 0 };
+    c.streaks.push(c.cur);
+  };
+  const cols = [];
+  for (let i = 0; i < Math.ceil(innerWidth / FS); i++) {
+    const c = { acc: 0, row: 0, v: 0, ch: "", cur: null, streaks: [] };
+    spawn(c, t0);
+    cols.push(c);
+  }
+  rain = { canvas, ctx, cols, until, last: t0 };
+  requestAnimationFrame(function frame(t) {
+    const r = rain;
+    if (!r) return;
+    const dt = Math.min(0.1, (t - r.last) / 1000);
+    r.last = t;
+    const alive = t < r.until;
+    const rows = Math.ceil(innerHeight / FS);
+    r.ctx.font = FS + "px Consolas, monospace";
+    let busy = false;
+    for (let i = 0; i < r.cols.length; i++) {
+      const c = r.cols[i];
+      if (!alive) c.v += 18 * dt;  // ending: streams accelerate off the screen
+      c.acc += c.v * dt;
+      while (c.acc >= 1) {                       // may cross >1 cell per frame
+        c.acc -= 1;
+        c.row += 1;
+        if (c.row > rows + 2) {
+          c.cur = null;
+          if (alive) spawn(c, t);                // respawn from above
+          break;
+        }
+        if (c.row < 0) continue;
+        // repaint the previous head in body green, draw the new head bright
+        if (c.ch && c.row > 0) {
+          r.ctx.fillStyle = "#00ff41";
+          r.ctx.fillText(c.ch, i * FS, (c.row - 1) * FS);
+        }
+        c.ch = Math.random() < .5 ? "0" : "1";
+        r.ctx.fillStyle = "#d6ffdd";
+        r.ctx.fillText(c.ch, i * FS, c.row * FS);
+        if (c.cur) c.cur.maxRow = c.row;
+      }
+      if (c.cur && c.row <= rows + 2) busy = true;
+      // erasure: each streak is consumed from its own top, ERASE_AFTER ms
+      // after it began descending, cell by cell at its own fall rate
+      for (const s of c.streaks) {
+        if (t < s.born + ERASE_AFTER) { busy = true; continue; }
+        if (!alive) s.v += 18 * dt;              // erasers keep pace at the end
+        s.eacc += s.v * dt;
+        while (s.eacc >= 1 && s.erow <= s.maxRow) {
+          s.eacc -= 1;
+          s.erow += 1;
+          // don't bite a NEWER streak that has since redrawn this cell
+          const redrawn = c.streaks.some(o =>
+            o.born > s.born && o.maxRow >= s.erow);
+          if (s.erow >= 0 && s.erow <= s.maxRow && !redrawn)
+            r.ctx.clearRect(i * FS - 1, s.erow * FS - 1, FS + 2, FS + 2);
+        }
+        if (!(s.erow > s.maxRow && s !== c.cur)) busy = true;
+      }
+      c.streaks = c.streaks.filter(s => !(s.erow > s.maxRow && s !== c.cur));
+    }
+    if ((!alive && !busy) || t > r.until + 20000) {  // every streak consumed
+      r.canvas.remove();
+      rain = null;
+      return;
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+function flashLine() {
+  const hb = document.querySelector("header").getBoundingClientRect().bottom;
+  $("hline").style.setProperty("--hy", Math.round(hb) + "px");
+  const f = $("hflash");
+  f.classList.remove("on");
+  void f.offsetWidth;                      // restart the animation
+  f.classList.add("on");
+}
+
+function pulseAll(kind) {
+  // a response landed: flash the entire header line in the channel colour
+  const k = ["mark", "explain", "command"].includes(kind) ? kind : null;
+  document.body.style.setProperty(
+    "--pulse", k ? "var(--pulse-" + k + ")" : "var(--accent)");
+  flashLine();
+  if (root.dataset.theme === "matrix" && rainOn) startRain();
+}
+
+/* matrix rain switch: shows 1 (enabled) / 0 (disabled); re-enabling plays
+   the downpour immediately as its own announcement */
+let rainOn = localStorage.rmRain !== "0";
+$("rainBtn").textContent = rainOn ? "1" : "0";
+$("rainBtn").onclick = () => {
+  rainOn = !rainOn;
+  localStorage.rmRain = rainOn ? "1" : "0";
+  $("rainBtn").textContent = rainOn ? "1" : "0";
+  if (rainOn) startRain();
+};
+
+function pulseOnline() {
+  // tablet came back: the header line flashes green
+  document.body.style.setProperty("--pulse", "var(--pulse-ok)");
+  flashLine();
+}
+
+/* ---------- stop button ---------- */
+$("stopBtn").onclick = async () => {
+  // pure-red ripple from the stop button - the one pulse that touches the
+  // top-left controls (dot + chips) as well as the progress bar. The button
+  // itself surges from its resting dim red to full red as it fires.
+  const b = $("stopBtn");
+  b.classList.remove("fired"); void b.offsetWidth; b.classList.add("fired");
+  document.body.style.setProperty("--pulse", "rgb(255,0,0)");
+  waveFrom(centerOf(b), ".chip, .dot, #barOuter", "pulsingTop");
+  try {
+    const r = await (await fetch("/stop")).json();
+    if (r.stopped) $("connTxt").textContent = "stopping current agent…";
+  } catch {}
+};
+
+function applyArrivals(resps) {
+  // -> the new arrival's kind, or undefined if nothing new landed
+  const maxId = resps.length ? Math.max(...resps.map(r => r.id)) : 0;
+  let newKind;
+  if (maxId > lastMax) {
+    if (lastMax > 0) {                     // a NEW response: collapse unpinned
+      for (const id of [...expanded]) if (!pinned.has(id)) expanded.delete(id);
+      const top = resps.find(r => r.id === maxId);
+      newKind = (top && top.kind) || null;
+    }
+    if (maxId) expanded.add(maxId);        // focus the newcomer
+    lastMax = maxId;
+  }
+  return newKind;
+}
+
+/* ---------- rendering ---------- */
+function esc(s) { const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+
+/* matrix mode: card screenshots are remapped per-pixel - white paper goes
+   black, black print goes matrix green - while SATURATED pixels (his red and
+   blue pen ink) keep their original colour, blended smoothly at antialiased
+   edges. Originals restore themselves when the theme changes back, because
+   the feed rebuilds from the untouched /img/ URLs. */
+const matrixCache = new Map();               // orig url -> processed dataURL
+function matrixPixel(r, g, b) {
+  const w = Math.min(1, (Math.max(r, g, b) - Math.min(r, g, b)) / 60);
+  if (w >= 1) return [r, g, b];              // coloured ink - untouched
+  const inv = 255 - (r + g + b) / 3;         // white -> 0, black -> full green
+  return [r * w,
+          g * w + inv * (1 - w),
+          b * w + inv * 0.255 * (1 - w)];    // green is #00ff41, so b ~ g/4
+}
+function matrixifyImg(img) {
+  const url = img.dataset.orig || img.getAttribute("src");
+  img.dataset.orig = url;
+  if (matrixCache.has(url)) { img.src = matrixCache.get(url); return; }
+  const work = () => {
+    try {
+      const cv = document.createElement("canvas");
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      if (!cv.width) return;
+      const cx = cv.getContext("2d");
+      cx.drawImage(img, 0, 0);
+      const d = cx.getImageData(0, 0, cv.width, cv.height), px = d.data;
+      for (let i = 0; i < px.length; i += 4) {
+        const m = matrixPixel(px[i], px[i + 1], px[i + 2]);
+        px[i] = m[0]; px[i + 1] = m[1]; px[i + 2] = m[2];
+      }
+      cx.putImageData(d, 0, 0);
+      const durl = cv.toDataURL("image/png");
+      if (matrixCache.size > 40)               // keep the cache bounded
+        matrixCache.delete(matrixCache.keys().next().value);
+      matrixCache.set(url, durl);
+      img.src = durl;
+    } catch (e) {}
+  };
+  if (img.complete && img.naturalWidth) work();
+  else img.onload = () => { img.onload = null; work(); };
+}
+
+function renderFeed(resps) {
+  const feed = $("feed");
+  if (!resps.length) {
+    feed.innerHTML = '<div class="empty">Waiting for Questions....</div>';
+    return;
+  }
+  feed.innerHTML = "";
+  const maxId = Math.max(...resps.map(r => r.id));
+  for (const r of [...resps].sort((a, b) => b.id - a.id)) {
+    const card = document.createElement("article");
+    // mark cards wear their score as a border colour; the verdict line is
+    // "n/m ..." so the fraction is read straight from the title
+    let score = "";
+    const kd = (r.kind || "").toLowerCase();
+    if (kd === "mark") {
+      score = " kind-mark";
+      const m = (r.title || "").match(/(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/);
+      const f = m ? parseFloat(m[1]) / parseFloat(m[2]) : NaN;
+      if (isFinite(f))
+        score += f >= 1 ? " mark-full" : f >= .5 ? " mark-mid" : " mark-low";
+    } else if (kd === "explain" || kd === "deep") {
+      score = " kind-explain";
+    } else if (kd === "command") {
+      score = " kind-command";
+    }
+    card.className = "card" + score + (expanded.has(r.id) ? " open" : "")
+                   + (r.id === maxId ? " focus" : "");
+    const where = (r.wb ? r.wb : "") + (r.page ? " p." + r.page : "");
+    card.innerHTML =
+      '<div class="cardHead">' +
+        '<span class="kind">' + esc((r.kind || "").toUpperCase()) + '</span>' +
+        '<span class="meta">' + esc(r.ts) + (where ? " &middot; " + esc(where) : "") + '</span>' +
+        '<span class="titleTxt">' + esc(r.title) + '</span>' +
+        '<button class="pinBtn' + (pinned.has(r.id) ? " pinned" : "") + '" title="pin">&#9733;</button>' +
+        '<button class="menuBtn" title="more">&#8942;</button>' +
+        '<div class="cardMenu"><div class="mi save">Save as PNG</div>' +
+        '<div class="mi del">Delete</div></div>' +
+      '</div>' +
+      '<div class="cardBody"><div class="bodyTxt">' + esc(r.body) + '</div>' +
+        (r.images || []).map(n => '<img loading="lazy" src="/img/' + encodeURIComponent(n) + '">').join("") +
+      '</div>';
+    card.querySelector(".cardHead").onclick = e => {
+      if (e.target.closest(".pinBtn, .menuBtn, .cardMenu")) return;
+      expanded.has(r.id) ? expanded.delete(r.id) : expanded.add(r.id);
+      card.classList.toggle("open");
+    };
+    card.querySelector(".pinBtn").onclick = () => {
+      pinned.has(r.id) ? pinned.delete(r.id) : pinned.add(r.id);
+      savePins();
+      card.querySelector(".pinBtn").classList.toggle("pinned");
+    };
+    const menu = card.querySelector(".cardMenu");
+    card.querySelector(".menuBtn").onclick = e => {
+      e.stopPropagation();
+      const was = menu.classList.contains("open");
+      document.querySelectorAll(".cardMenu.open").forEach(m => m.classList.remove("open"));
+      if (!was) menu.classList.add("open");
+    };
+    menu.querySelector(".save").onclick = async e => {
+      e.stopPropagation();
+      menu.classList.remove("open");
+      if (!window.html2canvas) { alert("PNG export needs internet (html2canvas CDN)"); return; }
+      const wasOpen = card.classList.contains("open");
+      card.classList.add("open");
+      const canvas = await html2canvas(card, {
+        backgroundColor: getComputedStyle(document.body).backgroundColor, scale: 2});
+      if (!wasOpen) card.classList.remove("open");
+      const a = document.createElement("a");
+      a.download = "response-" + r.id + "-" + (r.wb || "card") + ".png";
+      a.href = canvas.toDataURL("image/png");
+      a.click();
+    };
+    menu.querySelector(".del").onclick = async e => {
+      e.stopPropagation();
+      menu.classList.remove("open");
+      await fetch("/del?id=" + r.id).catch(() => {});
+      expanded.delete(r.id); pinned.delete(r.id); savePins();
+      renderedKey = ""; tick();
+    };
+    feed.appendChild(card);
+  }
+  if (root.dataset.theme === "matrix")
+    feed.querySelectorAll(".cardBody img").forEach(matrixifyImg);
+  // LaTeX: agents write $...$ / $$...$$; KaTeX renders it here (the phone
+  // shows it raw - this page is where formatted maths lives).
+  if (window.renderMathInElement) {
+    try {
+      renderMathInElement(feed, {
+        delimiters: [
+          {left: "$$", right: "$$", display: true},
+          {left: "\\[", right: "\\]", display: true},
+          {left: "$", right: "$", display: false},
+          {left: "\\(", right: "\\)", display: false}
+        ],
+        throwOnError: false
+      });
+    } catch (e) {}
+  }
+}
+// KaTeX loads deferred: once it arrives, force one re-render so maths in
+// cards drawn before it was ready gets typeset too.
+window.addEventListener("load", () => { renderedKey = ""; });
+
+/* ---------- chip info panels ---------- */
+let lastState = null;
+const openChips = [];              // stacked in click order
+
+const CMDS = [
+  ["model opus|sonnet|haiku", "Switch the model for marking AND explaining. Scope with 'mark haiku' or 'explain opus'."],
+  ["effort low|medium|high", "Reasoning effort. 'think harder' and 'faster' work too."],
+  ["which model?", "Reports the current model/effort per channel."],
+  ["tutor / tutor off", "Full-tutor mode: blue handwriting becomes a free-form question over the whole study tree, up to 600 words."],
+  ["wait … begin", "Patience mode for long prompts: 'wait' holds all coloured ink (grey still works); 'begin' fires everything added in between."],
+  ["start timer <N>", "Starts an N-minute countdown at the top of the dashboard - any number of minutes. Same timer as the stopwatch icon; at zero you choose continue or break."],
+  ["deep explain / deep off", "Blue circles go to a max-effort Fable agent that reads the entire corpus. Minutes per answer - break glass only."],
+  ["update progress ⚠", "ONE-TIME setup per workbook, and it can take several minutes (it re-marks every inked page). After that the marker keeps progress current automatically - only re-run if you worked with the watcher off. Full marks only; untimed extras and exam questions never count."],
+  ["screenshot q<N> [paper]", "Fetches question N's image from the source exam paper - ANY question number ('screenshot q3', 'screenshot q7 formative'). Bare 'screenshot' + a grey circle sends a colour render of the circled region instead."],
+  ["guide", "Sends the 60-second how-to guide to your phone."],
+  ["status", "Models, modes, request count, active workbook."],
+  ["restart", "Relaunches the watcher with the latest code."],
+  ["help", "Full command list to your phone."]
+];
+
+function infoHtml(kind, s) {
+  const p = (s && s.profiles) || {};
+  if (kind === "session") {
+    const ss = (s && s.session) || {};
+    const tok = n => (n || 0) >= 1000 ? (n / 1000).toFixed(1) + "k" : (n || 0);
+    return "<h3>SESSION</h3>" +
+      "<p>Started: <b>" + esc(ss.started || "?") + "</b></p>" +
+      "<p>Drills completed this session: <b>" + (ss.drills || 0) + "</b></p>" +
+      "<p>Tokens: <b>" + tok(ss.tok_in) + "</b> in &middot; <b>" +
+      tok(ss.tok_out) + "</b> out &middot; <b>" + tok(ss.tok_cache) +
+      "</b> cache-read</p>" +
+      (ss.cost ? "<p>Est. cost: <b>$" + (+ss.cost).toFixed(2) + "</b></p>" : "") +
+      "<div class='modelLine'>Counted from watcher launch; a restart " +
+      "resets it. Tokens cover every agent the watcher ran (marks, " +
+      "explains, commands, compactions).</div>";
+  }
+  if (kind === "mark") return (
+    "<h3>MARK — red ink</h3>" +
+    "<p>Circle finished work in <span class='inkR'>red</span> and it is marked " +
+    "strictly against the workbook's marking notes: a VERDICT line with the " +
+    "mark as <b>n/m</b>, exactly where marks were lost, and the annotated page " +
+    "image attached. Re-circle the same work any time for a second opinion.</p>" +
+    "<p>Card borders wear your score: " +
+    "<b style='color:var(--mk-low)'>&lt;50%</b> · " +
+    "<b style='color:var(--mk-mid)'>&ge;50%</b> · " +
+    "<b style='color:var(--mk-full)'>100%</b> — and a <b " +
+    "style='color:var(--mk-full)'>full-mark</b> drill ticks the progress " +
+    "checklist automatically.</p>" +
+    "<div class='modelLine'>Model: " + esc(p.mark || "?") + "</div>");
+  if (kind === "explain") return (
+    "<h3>EXPLAIN — blue ink</h3>" +
+    "<p>Circle anything in <span class='inkB'>blue</span> to have it explained " +
+    "differently from the workbook, ending with a check question. Blue " +
+    "<b>handwriting</b> is read as your question and answered directly.</p>" +
+    "<p>Extras: with <span class='inkG'>grey</span> <b>tutor</b> on, blue " +
+    "becomes a free-form question to a full tutor over the whole study tree " +
+    "(lectures, past papers, your real exam; up to 600 words). " +
+    "<span class='inkG'>Grey</span> <b>deep explain</b> sends blue to a " +
+    "max-effort agent that reads the entire corpus (minutes). Answers can " +
+    "<b>attach lecture-slide images</b> when seeing the source helps — just " +
+    "ask. Maths arrives as LaTeX and renders properly on this page.</p>" +
+    "<div class='modelLine'>Model: " + esc(p.explain || "?") +
+    (p.tutor ? "<span class='modeTag'>tutor ON</span>" : "") +
+    (p.deep ? "<span class='modeTag'>DEEP ON fable/max</span>" : "") + "</div>");
+  return (
+    "<h3>COMMAND — grey ink</h3>" +
+    "<p>Write any of these in <b>grey</b> (hover each for detail):</p>" +
+    CMDS.map(c => "<span class='cmdItem' title=\"" + esc(c[1]) + "\">" +
+                  esc(c[0]) + "</span>").join("") +
+    "<p class='modelLine'>⚠ <b>update progress</b> should only be needed " +
+    "ONCE (it seeds the drill checklists and can take several minutes); after " +
+    "that, marking keeps the bars current automatically.</p>" +
+    "<div class='modelLine'>Transcribed by: " + esc(p.command || "?") + "</div>");
+}
+
+function renderChipInfo() {
+  const box = $("chipInfo");
+  if (!openChips.length) { box.style.display = "none"; box.innerHTML = ""; return; }
+  box.innerHTML = openChips.map(k =>
+    '<div class="infoBox b-' + k + '">' + infoHtml(k, lastState) + "</div>").join("");
+  box.style.display = "block";
+}
+
+function toggleChip(k) {
+  const i = openChips.indexOf(k);
+  if (i >= 0) openChips.splice(i, 1); else openChips.push(k);
+  renderChipInfo();
+}
+
+for (const k of ["mark", "explain", "command"])
+  $("chip-" + k).onclick = () => toggleChip(k);
+// the connection area doubles as the session-info toggle - same left stack
+$("conn").onclick = () => toggleChip("session");
+
+/* ---------- study tracker sidebar ---------- */
+const PALETTE = ["#8e5bd0", "#e08a2e", "#2e86c1", "#27ae60", "#c0392b"];
+
+function renderTracker() {
+  const mods = (lastState && lastState.modules) || {};
+  const prog = (lastState && lastState.progress) || {};
+  const names = Object.keys(mods).sort();
+  if (!names.length) {
+    $("trkBody").innerHTML = '<div class="modRow modName">no module data yet</div>';
+    return;
+  }
+  const wbNum = k => parseInt((k.match(/(\d+)\s*$/) || [0, 0])[1], 10) || 0;
+  $("trkBody").innerHTML = names.map((n, ni) => {
+    const m = mods[n], col = PALETTE[ni % PALETTE.length];
+    const rows = Object.keys(prog)
+      .filter(k => k.toUpperCase().indexOf(n.toUpperCase() + "-") === 0)
+      .sort((a, b) => wbNum(a) - wbNum(b))
+      .map(k => {
+        const p = prog[k];
+        return '<div class="trkWb"><div class="modName"><span>WB' + wbNum(k) +
+               '</span><span>' + p.done + '/' + p.total + ' · ' + p.pct +
+               '%</span></div><div class="modBarO"><div class="modBarI" style="width:' +
+               p.pct + '%;background:' + col + '"></div></div></div>';
+      }).join("");
+    return '<div class="trkMod">' +
+           '<div class="trkModHead"><span class="trkModName" style="color:' + col +
+           '">' + esc(n) + '</span><span class="trkModPct">' + m.pct + '%</span></div>' +
+           '<div class="modName"><span>overall</span><span>' + m.done + '/' +
+           m.total + ' drills</span></div>' +
+           '<div class="modBarO big"><div class="modBarI" style="width:' + m.pct +
+           '%;background:' + col + '"></div></div>' +
+           rows + '</div>';
+  }).join("");
+}
+
+function setTracker(open) {
+  $("tracker").classList.toggle("open", open);
+  $("wbBox").classList.toggle("trkOpen", open);
+  if (open) renderTracker();
+}
+$("wbBox").onclick = () => setTracker(!$("tracker").classList.contains("open"));
+$("trkClose").onclick = () => setTracker(false);
+// clicking anywhere off the tracker closes it
+document.addEventListener("click", e => {
+  if ($("tracker").classList.contains("open") &&
+      !e.target.closest("#tracker, #wbBox")) setTracker(false);
+});
+
+/* ---------- pill choice screen (matrix) ---------- */
+const HANDS = null;
+
+let pill = null;
+function startPillRain() {
+  if (pill) {
+    if (!pill.dissolving) return;
+    stopPillRain();                    // mid-dissolve re-entry: clear first
+  }
+  if (!HANDS) return;
+  const FS = 16;
+  const mk = id => {
+    const cv = document.createElement("canvas");
+    cv.id = id;
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.ceil(innerWidth * dpr);
+    cv.height = Math.ceil(innerHeight * dpr);
+    cv.style.width = innerWidth + "px";
+    cv.style.height = innerHeight + "px";
+    document.body.appendChild(cv);
+    const cx = cv.getContext("2d");
+    cx.scale(dpr, dpr);
+    cx.textBaseline = "top";
+    cx.font = FS + "px Consolas, monospace";
+    return [cv, cx];
+  };
+  const [depositCv, dctx] = mk("pillRain");   // backdrop + settled digits
+  const [headsCv, hctx] = mk("pillHeads");    // falling heads, redrawn each frame
+  dctx.fillStyle = "rgba(0,0,0,.82)";
+  dctx.fillRect(0, 0, innerWidth, innerHeight);
+  const cols = Math.ceil(innerWidth / FS), rows = Math.ceil(innerHeight / FS);
+  // contain-fit the map's cell grid into the viewport's cell grid
+  const sc = Math.min(cols / HANDS.w, rows / HANDS.h);
+  const ox = (cols - HANDS.w * sc) / 2, oy = (rows - HANDS.h * sc) / 2;
+  const den = (i, rr) => {
+    const mx = Math.floor((i - ox) / sc), my = Math.floor((rr - oy) / sc);
+    if (mx < 0 || my < 0 || mx >= HANDS.w || my >= HANDS.h) return 0;
+    return (+HANDS.rows[my][mx] || 0) / 9;
+  };
+  // 3 staggered heads per column: the outline converges in ~4s (verified
+  // ~98% of strong edges settled) while still visibly assembling itself
+  const streams = [];
+  for (let i = 0; i < cols; i++)
+    for (let k = 0; k < 3; k++)
+      streams.push({ col: i, row: -Math.floor(Math.random() * rows), acc: 0,
+                     v: 14 + Math.random() * 18 });
+  const settled = new Uint8Array(cols * rows);
+  // the pills themselves are clusters of red/blue digits that materialise
+  // WITH the outline; the buttons are invisible click targets over them
+  const mkPill = (fr, colour) => {
+    if (!fr) return null;
+    const pcx = ox + fr[0] * HANDS.w * sc, pcy = oy + fr[1] * HANDS.h * sc;
+    // original capsule size, on a half-cell lattice with smaller digits so
+    // the pill still reads as solid colour; the green rain is kept OUT of a
+    // slightly larger exclusion zone so nothing clouds it
+    const cells = [];
+    for (let rr = pcy - 1.6; rr <= pcy + 1.6; rr += 0.5)
+      for (let ii = pcx - 3.4; ii <= pcx + 3.4; ii += 0.55) {
+        const ex = (ii - pcx) / 3.0, ey = (rr - pcy) / 1.4;
+        if (ex * ex + ey * ey <= 1) cells.push([ii, rr]);
+      }
+    cells.sort(() => Math.random() - .5);      // materialise in random order
+    return { colour, cells, done: 0, cx: pcx, cy: pcy };
+  };
+  const pills = [
+    { p: mkPill(HANDS.red, "#ff3040"), btn: $("pillRed"), msg: $("pillMsgRed") },
+    { p: mkPill(HANDS.blue, "#37a6ff"), btn: $("pillBlue"), msg: $("pillMsgBlue") },
+  ];
+  for (const { p, btn, msg } of pills) {
+    if (!p) continue;
+    btn.style.left = (p.cx * FS - 55) + "px";
+    btn.style.top = (p.cy * FS - 30) + "px";
+    btn.style.right = "auto";
+    msg.style.left = (p.cx * FS) + "px";
+    msg.style.top = ((p.cy + 2.4) * FS) + "px";
+  }
+  // no green settles or passes within a whisker of either pill
+  const nearPill = (ii, rr) => pills.some(({ p }) => p &&
+    Math.pow((ii - p.cx) / 4.0, 2) + Math.pow((rr - p.cy) / 2.2, 2) <= 1);
+  pill = { depositCv, headsCv, raf: 0, last: performance.now(),
+           t0: performance.now(), msgsShown: false };
+  const frame = t => {
+    if (!pill) return;
+    const dt = Math.min(0.1, (t - pill.last) / 1000);
+    pill.last = t;
+    // choice made: he fades away the way the standard rain ends - per-column
+    // erasers, staggered and at their own speeds, consume the figure (and
+    // the dark veil with it) top-down in streaks
+    if (pill.dissolving) {
+      hctx.clearRect(0, 0, innerWidth, innerHeight);
+      if (!pill.er) {
+        pill.er = [];
+        for (let i = 0; i < cols; i++)
+          pill.er.push({ row: -1 - Math.floor(Math.random() * 12), acc: 0,
+                         v: 14 + Math.random() * 18 });
+      }
+      let left = false;
+      for (let i = 0; i < cols; i++) {
+        const e = pill.er[i];
+        e.v += 18 * dt;
+        e.acc += e.v * dt;
+        while (e.acc >= 1) {
+          e.acc -= 1;
+          e.row += 1;
+          if (e.row >= 0 && e.row <= rows)
+            dctx.clearRect(i * FS - 1, e.row * FS - 1, FS + 2, FS + 2);
+        }
+        if (e.row <= rows) left = true;
+      }
+      if (!left) {
+        pill.depositCv.remove();
+        pill.headsCv.remove();
+        pill = null;
+        return;
+      }
+      pill.raf = requestAnimationFrame(frame);
+      return;
+    }
+    hctx.clearRect(0, 0, innerWidth, innerHeight);
+    hctx.fillStyle = "rgba(160,255,180,.8)";
+    for (const c of streams) {
+      c.acc += c.v * dt;
+      while (c.acc >= 1) {
+        c.acc -= 1;
+        c.row += 1;
+        if (c.row > rows) {
+          c.row = -Math.floor(Math.random() * 10);
+          c.v = 14 + Math.random() * 18;
+          break;
+        }
+        if (c.row < 0) continue;
+        // as a head passes a cell it may DEPOSIT a permanent digit - the
+        // probability and brightness follow the map's edge density
+        const d = nearPill(c.col, c.row) ? 0 : den(c.col, c.row);
+        if (d > 0 && !settled[c.row * cols + c.col]
+            && Math.random() < Math.min(1, d * 1.8)) {
+          settled[c.row * cols + c.col] = 1;
+          dctx.fillStyle =
+            "rgba(0,255,65," + (0.35 + 0.65 * d).toFixed(2) + ")";
+          dctx.fillText(Math.random() < .5 ? "0" : "1",
+                        c.col * FS, c.row * FS);
+          hctx.fillStyle = "rgba(160,255,180,.8)";
+        }
+      }
+      if (c.row >= 0 && c.row <= rows && !nearPill(c.col, c.row))
+        hctx.fillText(Math.random() < .5 ? "0" : "1", c.col * FS, c.row * FS);
+    }
+    // the pills assemble alongside the outline: a few coloured digits per
+    // frame from ~1s in, complete around the time the figure is
+    let allDone = true;
+    if (t - pill.t0 > 1000) {
+      for (const { p } of pills) {
+        if (!p) continue;
+        const want = Math.min(p.cells.length,
+          Math.ceil(p.cells.length * (t - pill.t0 - 1000) / 2500));
+        dctx.font = "13px Consolas, monospace";
+        while (p.done < want) {
+          const [ii, rr] = p.cells[p.done++];
+          dctx.fillStyle = "rgba(0,0,0,.9)";
+          dctx.fillRect(ii * FS - 1, rr * FS - 1, 11, 14);
+          dctx.fillStyle = p.colour;
+          dctx.fillText(Math.random() < .5 ? "0" : "1", ii * FS, rr * FS);
+        }
+        dctx.font = FS + "px Consolas, monospace";
+        if (p.done < p.cells.length) allDone = false;
+      }
+    } else allDone = false;
+    if (allDone && !pill.msgsShown) {          // labels only once they exist
+      pill.msgsShown = true;
+      $("pillMsgRed").classList.add("on");
+      $("pillMsgBlue").classList.add("on");
+    }
+    pill.raf = requestAnimationFrame(frame);
+  };
+  pill.raf = requestAnimationFrame(frame);
+}
+function stopPillRain() {              // instant teardown (edge cases only)
+  if (!pill) return;
+  cancelAnimationFrame(pill.raf);
+  pill.depositCv.remove();
+  pill.headsCv.remove();
+  pill = null;
+  for (const id of ["pillRed", "pillBlue"]) $(id).style.cssText = "";
+  for (const id of ["pillMsgRed", "pillMsgBlue"])
+    $(id).classList.remove("on");
+}
+function dissolvePillRain() {          // graceful: streak-consume the figure
+  if (!pill || pill.dissolving) return;
+  pill.dissolving = true;              // the frame loop takes it from here
+  for (const id of ["pillRed", "pillBlue"]) $(id).style.cssText = "";
+  for (const id of ["pillMsgRed", "pillMsgBlue"])
+    $(id).classList.remove("on");
+}
+
+/* ---------- the white rabbit ---------- */
+function neoSequence(knock) {
+  if (root.dataset.theme === "matrix") return;
+  const box = $("neoBox");
+  box.innerHTML = "";
+  box.classList.add("on");
+  const add = txt => {
+    const d = document.createElement("div");
+    d.textContent = txt || " ";
+    box.appendChild(d);
+    return d;
+  };
+  const lines = ["Wake up, Neo...", "The Matrix has you...",
+                 "Follow the white rabbit."];
+  if (knock) lines.push("", "", "Knock, knock, Neo.");
+  // typed letter by letter, ~2s pause after each finished line
+  let li = 0;
+  const nextLine = () => {
+    if (li >= lines.length) {          // fires the moment typing finishes
+      setTimeout(() => box.classList.remove("on"), 3000);
+      if (knock)
+        spawnRabbit();                 // summons: it runs as the text ends
+      else
+        // natural (leet o'clock) sighting: the rabbit passes at some point
+        // in the next five minutes - miss it and it's gone this session
+        setTimeout(spawnRabbit, 3000 + Math.random() * 300000);
+      return;
+    }
+    const txt = lines[li++];
+    const d = add("");
+    if (!txt) { setTimeout(nextLine, 150); return; }  // blank lines are quick
+    let ci = 0;
+    const tick = () => {
+      ci++;
+      d.textContent = txt.slice(0, ci);
+      if (ci < txt.length) setTimeout(tick, 45 + Math.random() * 45);
+      else setTimeout(nextLine, li >= lines.length ? 0 : 2000);
+    };
+    setTimeout(tick, 350);
+  };
+  nextLine();
+}
+setTimeout(neoSequence, 1337 * 1000);   // leet o'clock, once per session
+
+let rabbit = null;
+function spawnRabbit() {
+  if (rabbit || root.dataset.theme === "matrix") return;
+  const el = document.createElement("div");
+  el.id = "rabbit";
+  document.body.appendChild(el);
+  // runs LEFT to RIGHT, cycling the 6 sprite frames as it goes
+  const st = { x: -70, v: 130 + Math.random() * 50, fr: 0, ft: 0,
+               last: performance.now() };
+  rabbit = { el, st, raf: 0 };
+  el.onclick = () => { removeRabbit(); enterMatrix(); };
+  const frame = t => {
+    if (!rabbit) return;
+    const dt = Math.min(100, t - st.last);
+    st.last = t;
+    st.x += st.v * dt / 1000;
+    st.ft += dt;
+    if (st.ft > 70) {
+      st.ft = 0;
+      st.fr = (st.fr + 1) % 6;
+      el.style.backgroundPosition = (-st.fr * 64) + "px 0";
+    }
+    el.style.left = st.x + "px";
+    if (st.x > innerWidth + 70) { removeRabbit(); return; }
+    rabbit.raf = requestAnimationFrame(frame);
+  };
+  rabbit.raf = requestAnimationFrame(frame);
+}
+function removeRabbit() {
+  if (!rabbit) return;
+  cancelAnimationFrame(rabbit.raf);
+  rabbit.el.remove();
+  rabbit = null;
+}
+
+// entering the matrix: digits swamp the entire screen, the theme swaps
+// beneath the cover, then it fades the new way - per-column erasers
+// consuming the wall of digits top-down to reveal the changed page
+let swamp = null;
+function enterMatrix() {
+  if (swamp || root.dataset.theme === "matrix") return;
+  window.matrixUnlocked = true;   // theme button cycles all three from now on
+  const FS = 16;
+  const canvas = document.createElement("canvas");
+  canvas.id = "swamp";
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.ceil(innerWidth * dpr);
+  canvas.height = Math.ceil(innerHeight * dpr);
+  canvas.style.width = innerWidth + "px";
+  canvas.style.height = innerHeight + "px";
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.textBaseline = "top";
+  ctx.font = FS + "px Consolas, monospace";
+  const cols = Math.ceil(innerWidth / FS), rows = Math.ceil(innerHeight / FS);
+  const streams = [];
+  for (let i = 0; i < cols; i++)
+    for (let k = 0; k < 3; k++)
+      streams.push({ col: i, row: -Math.floor(Math.random() * rows), acc: 0,
+                     v: 30 + Math.random() * 20 });
+  const covered = new Uint8Array(cols * rows);
+  let nCovered = 0;
+  swamp = { canvas, raf: 0, last: performance.now(), phase: "fill", er: null };
+  const frame = t => {
+    if (!swamp) return;
+    const dt = Math.min(0.1, (t - swamp.last) / 1000);
+    swamp.last = t;
+    if (swamp.phase === "fill") {
+      for (const c of streams) {
+        c.acc += c.v * dt;
+        while (c.acc >= 1) {
+          c.acc -= 1;
+          c.row += 1;
+          if (c.row > rows) { c.row = -Math.floor(Math.random() * 6); break; }
+          if (c.row < 0) continue;
+          ctx.fillStyle = "#000";
+          ctx.fillRect(c.col * FS - 1, c.row * FS - 1, FS + 2, FS + 2);
+          ctx.fillStyle = Math.random() < .12 ? "#d6ffdd" : "#00ff41";
+          ctx.fillText(Math.random() < .5 ? "0" : "1", c.col * FS, c.row * FS);
+          const k = c.row * cols + c.col;
+          if (!covered[k]) { covered[k] = 1; nCovered++; }
+        }
+      }
+      if (nCovered >= cols * rows * 0.995) {
+        localStorage.rmPrevTheme = root.dataset.theme;
+        setTheme("matrix");          // the page changes beneath the cover
+        renderedKey = "";            // so card images matrixify
+        swamp.phase = "reveal";
+      }
+    } else {
+      if (!swamp.er) {
+        swamp.er = [];
+        for (let i = 0; i < cols; i++)
+          swamp.er.push({ row: -1 - Math.floor(Math.random() * 12), acc: 0,
+                          v: 14 + Math.random() * 18 });
+      }
+      let left = false;
+      for (let i = 0; i < cols; i++) {
+        const e = swamp.er[i];
+        e.v += 18 * dt;
+        e.acc += e.v * dt;
+        while (e.acc >= 1) {
+          e.acc -= 1;
+          e.row += 1;
+          if (e.row >= 0 && e.row <= rows)
+            ctx.clearRect(i * FS - 1, e.row * FS - 1, FS + 2, FS + 2);
+        }
+        if (e.row <= rows) left = true;
+      }
+      if (!left) { canvas.remove(); swamp = null; return; }
+    }
+    swamp.raf = requestAnimationFrame(frame);
+  };
+  swamp.raf = requestAnimationFrame(frame);
+}
+
+/* ---------- clock + stopwatch countdown ---------- */
+// modes: clock (local time) -> count -> paused <-> count -> choice -> break.
+// Clicking the running timer pauses it; play resumes, cross skips straight
+// to the decision. At zero, matrix offers the pills, other themes the pop-up.
+const pad2 = n => String(n).padStart(2, "0");
+let tMode = "clock", tEnd = 0, tLeft = 0;
+const fmtLeft = ms => {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return pad2(Math.floor(s / 60)) + ":" + pad2(s % 60);
+};
+function tSet(mode) {
+  tMode = mode;
+  $("clockTime").classList.toggle("counting",
+    mode === "count" || mode === "paused");
+  $("clockTime").title =
+    mode === "count" ? "click to pause" :
+    mode === "paused" ? "click to resume" : "";
+  $("swCtl").classList.toggle("on", mode === "paused");
+  const cm = mode === "choice" && root.dataset.theme === "matrix" && !!HANDS;
+  document.body.classList.toggle("choosing", cm);
+  if (cm) startPillRain(); else dissolvePillRain();
+  $("choiceBox").classList.toggle("on", mode === "choice" && !cm);
+  $("breakBox").classList.toggle("on", mode === "break");
+}
+function clockTick() {
+  const now = new Date();
+  if (tMode === "count") {
+    const left = tEnd - now.getTime();
+    if (left <= 0) { $("clockTime").textContent = "00:00"; tSet("choice"); }
+    else $("clockTime").textContent = fmtLeft(left);
+  } else if (tMode === "paused") {
+    $("clockTime").textContent = fmtLeft(tLeft);
+  } else if (tMode === "break") {
+    const left = tEnd - now.getTime();
+    if (left <= 0) tSet("clock");
+    else $("breakTime").textContent = fmtLeft(left);
+  }
+  if (tMode === "clock")
+    $("clockTime").textContent = pad2(now.getHours()) + ":" +
+      pad2(now.getMinutes()) + ":" + pad2(now.getSeconds());
+}
+setInterval(clockTick, 250);
+clockTick();
+
+$("swBtn").onclick = () => $("swOpts").classList.toggle("open");
+for (const b of document.querySelectorAll(".swN"))
+  b.onclick = () => {
+    tEnd = Date.now() + parseInt(b.textContent, 10) * 60000;
+    $("swOpts").classList.remove("open");
+    tSet("count");
+    clockTick();
+  };
+$("clockTime").onclick = () => {
+  if (tMode === "count") { tLeft = tEnd - Date.now(); tSet("paused"); }
+  else if (tMode === "paused") { tEnd = Date.now() + tLeft; tSet("count"); }
+  clockTick();
+};
+$("swPlay").onclick = () => { tEnd = Date.now() + tLeft; tSet("count"); clockTick(); };
+$("swSkip").onclick = () => { $("clockTime").textContent = "00:00"; tSet("choice"); };
+// film-accurate: RED escapes the matrix (the break), BLUE stays in it
+$("pillBlue").onclick = () => tSet("clock");
+$("cbCont").onclick = () => tSet("clock");
+const startBreak = () => { tEnd = Date.now() + 15 * 60000; tSet("break"); clockTick(); };
+$("pillRed").onclick = startBreak;
+$("cbBreak").onclick = startBreak;
+$("breakBox").onclick = () => tSet("clock");
+
+/* ---------- polling ---------- */
+let prevOnline = null;             // null = unknown, so no pulse on first load
+let lastTimerN = null;             // grey "start timer N" directives seen
+let lastRabbitN = null;
+async function tick() {
+  let s;
+  try { s = await (await fetch("/state", {cache: "no-store"})).json(); }
+  catch {
+    $("dot").classList.remove("on"); $("connTxt").textContent = "watcher offline";
+    prevOnline = false; return;
+  }
+
+  $("dot").classList.toggle("on", !!s.online);
+  $("connTxt").textContent = s.online ? "tablet connected" : "tablet unreachable";
+  if (prevOnline === false && s.online) pulseOnline();
+  prevOnline = !!s.online;
+
+  lastState = s;
+  for (const k of ["mark", "explain", "command"]) {
+    const chip = $("chip-" + k);
+    const n = (s.jobs || []).filter(j => j.kind === k).length;
+    chip.classList.toggle("busy", n > 0);
+    const t = (s.times || {})[k];
+    chip.title = (t && t.avg != null)
+      ? "avg response " + t.avg + "s (" + t.n + " this session)"
+      : "avg response: n/a yet";
+  }
+  if (openChips.length) renderChipInfo();
+
+  const wb = s.active_wb, prog = wb && s.progress ? s.progress[wb] : null;
+  $("wbTxt").textContent = wb || "no workbook active";
+  if (prog) {
+    $("barInner").style.width = prog.pct + "%";
+    $("pctTxt").textContent = prog.done + "/" + prog.total +
+      (prog.unit ? " " + prog.unit : "") + " · " + prog.pct + "%";
+  } else {
+    $("barInner").style.width = "0%";
+    $("pctTxt").textContent = wb ? "no scan yet" : "";
+  }
+
+  // grey "start timer N": pick up new directives (and, after a page refresh,
+  // resume one that is still running - remaining time is computed server-side
+  // start stamp, so nothing is lost)
+  if (s.timer && s.timer.n !== lastTimerN) {
+    lastTimerN = s.timer.n;
+    const left = s.timer.mins * 60000 - Math.max(0, Date.now() - s.timer.ts * 1000);
+    if (left > 1000) {
+      tEnd = Date.now() + left;
+      tSet("count");
+      clockTick();
+    }
+  }
+
+  if (s.rabbit && s.rabbit.n !== lastRabbitN) {
+    lastRabbitN = s.rabbit.n;
+    // only a FRESH summons - a page refresh must not replay an old one.
+    // The typed sequence runs; the rabbit launches the moment it finishes.
+    if (Date.now() / 1000 - s.rabbit.ts < 60) neoSequence(true);
+  }
+
+  if ($("tracker").classList.contains("open")) renderTracker();
+
+  const newKind = applyArrivals(s.responses || []);
+  const key = (s.responses || []).map(r => r.id).join(",") + "|" +
+              [...expanded].join(",") + "|" + [...pinned].join(",");
+  if (key !== renderedKey) { renderedKey = key; renderFeed(s.responses || []); }
+  // pulse AFTER the feed re-render so the fresh cards get their wave delays
+  if (newKind !== undefined) pulseAll(newKind);
+}
+tick();
+setInterval(tick, 700);
+</script>
+</body>
+</html>
