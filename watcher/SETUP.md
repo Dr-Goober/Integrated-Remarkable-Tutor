@@ -1,12 +1,16 @@
 # One-time setup
 
-Twenty minutes, four parts. Everything here survives reboots; only firmware updates undo parts 2–3.
+Twenty-five minutes, five parts. Everything here survives reboots; only firmware updates undo parts 2–3.
 
-## 1 · Phone notifications (ntfy) — 2 min
+Parts 1 and 5 are two different ways to read your feedback, and you do not need both. The **dashboard** (part 5) renders maths properly, shows progress and lets you manage responses, but only works while you are on the same network as the watcher. **ntfy** (part 1) is a push notification that reaches you anywhere. Start with the dashboard; add ntfy if you want alerts away from your desk.
+
+## 1 · Phone notifications (ntfy) — 2 min · optional
+
+Push is **off by default**, because the dashboard already shows every reply and the ntfy round-trip is a second copy of it. Turn it on only if you want alerts when you are away from the dashboard.
 
 1. Install **ntfy** (free, iOS/Android).
 2. Invent a topic name. It is the ONLY secret protecting your feedback — make it long and random, e.g. `rt-9f2a71c4b8e3`. Tap **+** in the app and subscribe to it.
-3. On the PC: `setx RM_NTFY_TOPIC "rt-9f2a71c4b8e3"` (or edit the constant in `rm_feedback.py`).
+3. On the PC: `setx RM_NTFY_TOPIC "rt-9f2a71c4b8e3"` and `setx RM_NTFY 1` (on Linux/macOS, export both before launching). Without `RM_NTFY=1` the watcher stays silent no matter what topic is set.
 4. Test from PowerShell — it should pop on your phone in seconds:
    ```powershell
    Invoke-RestMethod -Uri "https://ntfy.sh/rt-9f2a71c4b8e3" -Method Post -Body "hello"
@@ -81,6 +85,64 @@ setx RM_STUDY_ROOT "C:\path\to\your\Study"
 Python must be **3.10+** (`rmscene` requires it). If you have several Pythons, the launcher pins `py -3.13` — edit it to match yours.
 
 Finally, edit the `WORKBOOKS` map at the top of `rm_feedback.py` (beside this file): for each PDF you study on the tablet, map its tablet document name to `(source PDF path, marking-notes markdown path)`, both relative to `RM_STUDY_ROOT` — keep one folder per module, since the first path segment of the source PDF is treated as the module name. Fill in the `EXAM_DATES` dict beside the map so the tutor knows each module's exam. The marking notes are what answers get marked *against* — see `../workbook-pipeline/BUILD-YOUR-MODULE.md` for how to produce good ones.
+
+## 5 · The dashboard — on the computer and on your phone — 5 min
+
+The watcher serves a small read-only web page: the live response feed with maths rendered properly, per-channel activity lights, a progress bar per workbook, the study tracker and a countdown timer. It is a mirror, not a control surface — ink on the tablet remains the only way to drive the watcher.
+
+### On the computer running the watcher
+
+Nothing to configure. Start the watcher and open:
+
+```
+http://localhost:8477
+```
+
+The page needs the watcher running; it holds no state of its own and the feed starts empty on each launch.
+
+### On your phone (same Wi-Fi)
+
+By default the server binds to loopback only, so nothing else on the network can reach it. To open it to your LAN:
+
+**Linux/macOS** — uncomment the `RM_WEB_HOST` line in `START-WATCHER.sh`, or export it yourself before launching:
+```sh
+export RM_WEB_HOST=0.0.0.0        # 127.0.0.1 puts it back to this machine only
+export RM_WEB_PORT=8477           # optional
+```
+
+**Windows** — `setx RM_WEB_HOST 0.0.0.0`, then open a new terminal so the variable is picked up.
+
+Then find the computer's LAN address:
+
+```sh
+ip -4 -brief addr           # Linux   -> e.g. 192.168.1.42/24
+ipconfig                    # Windows -> "IPv4 Address"
+ipconfig getifaddr en0      # macOS
+```
+
+Open `http://<that-address>:8477` on the phone. If it times out, the firewall is the usual cause — open the port to your subnet only, never the whole world:
+
+```sh
+sudo ufw allow from 192.168.1.0/24 to any port 8477 proto tcp    # Linux (ufw)
+```
+```powershell
+New-NetFirewallRule -DisplayName "reMarkable dashboard" -Direction Inbound `
+  -LocalPort 8477 -Protocol TCP -Action Allow -Profile Private
+```
+
+### Make it a home-screen app
+
+The page ships a web app manifest and an icon, so it installs without a store:
+
+- **iOS/Safari** — Share → *Add to Home Screen*. It launches full screen with no browser chrome.
+- **Android/Chrome** — ⋮ → *Install app* / *Add to Home screen*.
+
+The layout has a dedicated phone breakpoint: the response feed, timer and controls are all reachable one-handed, and the workbook name is abbreviated (`MODULE-A WB2`) to fit.
+
+### Two limits worth knowing up front
+
+- **It is LAN-only.** Leave the house and the page stops loading. A mesh VPN such as Tailscale on both devices fixes this and gives you an HTTPS hostname as a side effect.
+- **No push, and no authentication.** Web push on iOS requires HTTPS, which plain-HTTP-over-LAN cannot provide — that is what ntfy (part 1) is for. There is also no login: anyone on your network who finds the port can read your feedback and delete cards. That is a reasonable trade on a home network and a bad one on a shared or public one, where you should leave `RM_WEB_HOST` at its default.
 
 ## Daily use
 

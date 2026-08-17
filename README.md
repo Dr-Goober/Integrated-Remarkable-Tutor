@@ -1,13 +1,15 @@
 # Integrated reMarkable Tutor
 
-A Python watcher connects to a reMarkable 2 over SSH and monitors its stroke files for ink in trigger colours: circle handwritten work in **red** to have it marked, **blue** to have it explained, or write a command in **grey**, and the matching Claude agent spins up, reads your page grounded in your own study materials, and pushes its reply to your phone via ntfy. You never leave the page — the phone is just a notification display. This repository holds everything needed to rebuild the workflow: the watcher and helper scripts, one-time setup instructions, and the Claude skill files that turn raw course PDFs into a study corpus, write-on workbooks, and the tutor briefs the marking is grounded in.
+A Python watcher connects to a reMarkable 2 over SSH and monitors its stroke files for ink in trigger colours: circle handwritten work in **red** to have it marked, **blue** to have it explained, or write a command in **grey**, and the matching Claude agent spins up, reads your page grounded in your own study materials, and posts its reply to a local dashboard you can open on the computer or on your phone, with optional ntfy push for when you are away from it. You never leave the page — the screen is just a display. This repository holds everything needed to rebuild the workflow: the watcher and helper scripts, one-time setup instructions, and the Claude skill files that turn raw course PDFs into a study corpus, write-on workbooks, and the tutor briefs the marking is grounded in.
 
 Turn a reMarkable tablet into a handwriting-first AI study loop:
 
-- **Circle your handwritten work in RED** → it gets marked, strictly, against a real mark scheme, on your phone within ~30 s
+- **Circle your handwritten work in RED** → it gets marked, strictly, against a real mark scheme, within ~30 s
 - **Circle anything in BLUE** → it gets explained differently than your notes explain it; blue *handwriting* is read as your question and answered directly
 - **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `tutor` (blue becomes a free-form question to a full tutor), `screenshot q12` (fetches that question's image from the source exam PDF), `wait` … `begin` (hold your ink while writing a long prompt, then fire it all), `start timer 25` (a study countdown on the dashboard), `status`, `restart`, `help`
-- **A local dashboard** at `http://localhost:8477` mirrors the loop: live replies with rendered LaTeX, per-workbook and per-module progress bars, a session token/cost meter, a stop button that kills the in-flight agent, and study timers with a built-in break flow
+- **Draw a GREY box** around anything, no words needed → that crop is sent back to the dashboard, rendered from the source PDF
+- **The three channels run in parallel.** Circle in blue, red and grey one after another and all three agents work at once, each on its own conversation — you do not queue behind the slowest one
+- **A local dashboard** mirrors the loop: live replies with rendered LaTeX, per-workbook and per-module progress bars, a session token/cost meter, a stop button that kills the in-flight agent, and study timers with a built-in break flow. It runs at `http://localhost:8477` on the computer, and installs to your phone's home screen as a full-screen app over Wi-Fi — see [`watcher/SETUP.md`](watcher/SETUP.md) part 5
 - You keep writing on paper-like e-ink the whole time. No app switching, no typing, no chat window.
 
 Built during a real two-exam sprint (and battle-tested on it). Everything here is the generalised version of that setup.
@@ -15,9 +17,10 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
 ```
  reMarkable ──SSH (read-only)──> watcher (PC) ──"claude -p"──> Claude
      ^                              │  colour-coded stroke detection,      │
-     │ you write with               │  dedup, page→PDF mapping,            │
-     │ coloured pens                │  render, per-workbook sessions       v
-     └── you erase circles          └────────── ntfy push ─────────> your phone
+     │ you write with               │  dedup, page→PDF mapping, render,    │
+     │ coloured pens                │  one session per workbook × channel  v
+     │                              ├──── dashboard :8477 ────> laptop + phone
+     └── you erase circles          └──── ntfy push (optional) ────> phone
 ```
 
 ## Repo layout — two segments
