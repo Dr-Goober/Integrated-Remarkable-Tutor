@@ -16,7 +16,7 @@ Run it when you sit down, Ctrl-C when you finish:
 
 Design notes
 ------------
-* The 5-second poll NEVER invokes a model. It is one `stat` over a reused SSH
+* The 2-second poll NEVER invokes a model. It is one `stat` over a reused SSH
   connection; detection is pure geometry. Tokens are only spent when a coloured
   circle actually appears, which is why sitting idle costs nothing.
 * Trigger identity is the hash of the coloured strokes themselves, not "question
@@ -73,20 +73,30 @@ XOCHITL = "/home/root/.local/share/remarkable/xochitl"
 NTFY_TOPIC = os.environ.get("RM_NTFY_TOPIC", "CHANGE-ME-long-random-string")
 NTFY_URL = "https://ntfy.sh/" + NTFY_TOPIC
 
+# Local dashboard: a read-only mirror of the loop served on this machine.
+# RM_WEB_HOST=0.0.0.0 opens it to the LAN (phone browser); default is local.
+WEB_HOST = os.environ.get("RM_WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.environ.get("RM_WEB_PORT", "8477"))
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STUDY = os.environ.get("RM_STUDY_ROOT") or os.path.dirname(os.path.dirname(HERE))
 STATE_PATH = os.path.join(HERE, ".rm_feedback_state.json")
 WORK_DIR = os.path.join(HERE, ".rm_feedback_tmp")
 LOG_PATH = os.path.join(HERE, "rm_feedback.log")
 
-POLL_SECONDS = 5
+POLL_SECONDS = 2                 # one SSH stat per poll - cheap enough to run
+                                 # this often, and the poll wait dominated the
+                                 # ink-to-response latency at 5s
 HEARTBEAT_SECONDS = 300          # proof-of-life, instead of a line per stroke
-OFFLINE_ALERT_AFTER = 4          # consecutive failed polls before phoning it in
-SETTLE_POLLS = 2                 # a changed page must sit unchanged this many
-                                 # polls (~10 s of pen-up) before its ink is
-                                 # acted on - xochitl commits mid-thought at any
-                                 # decent pause, and answering a half-written
-                                 # question is worse than answering 10 s later
+OFFLINE_ALERT_AFTER = 8          # consecutive failed polls before phoning it
+                                 # in - scaled with the faster poll so the
+                                 # alert still waits ~25s of wall-clock
+SETTLE_POLLS = 0                 # fire the moment a page's mtime changes -
+                                 # xochitl only commits ink after pen-up, so a
+                                 # write is already a complete thought. For long
+                                 # prompts built over several commits, grey
+                                 # 'wait' ... 'begin' holds fire explicitly
+                                 # (patience mode) instead of a blanket debounce
 CLAUDE_TIMEOUT = 300
 
 # rM stores annotations as page pixels at the panel's 226 DPI, x centred on the
@@ -414,6 +424,302 @@ def pull(rel, dest):
     return dest
 
 
+PROGRESS_MIN_BYTES = 6000    # a .rm smaller than this is a stray mark, not work
+EXAM_SECTION_RE = re.compile(
+    r"\b(mock|exam paper|past paper|timed (mock|exam)|exam section"
+    r"|exam questions)\b", re.I)
+
+
+# What counts toward progress: drills D<n> AND mid-book exercises E<n>.
+# What never counts: the mock/exam section at the back, and items the workbook
+# itself flags as outside the timed session (e.g. "optional overspill" pages
+# and explicit "optional drills D11-D13" style notes).
+OPTIONAL_PAGE_RE = re.compile(
+    r"(?i)optional overspill|not part of the .{0,30}(?:budget|timer)"
+    r"|only if you finish(?:ed)? early"
+    r"|not (?:included|counted) in the .{0,30}(?:time|timer|min)")
+OPTIONAL_RANGE_RE = re.compile(
+    r"(?i)optional drills?\s+D(\d{1,2})\s*[–—-]\s*D?(\d{1,2})")
+
+
+def drill_list(pdf_path):
+    """Countable item labels (D3, E1, ...) in the workbook. Deterministic and
+    cheap - this is the progress bar's denominator. An item is dropped only if
+    it is named in an explicit "optional drills D11-D13" note, or if EVERY page
+    it appears on is optional-flagged - contents pages that both list all
+    drills and mention the optional section must not poison regular drills."""
+    pages_of, excluded = {}, set()
+    try:
+        doc = pymupdf.open(pdf_path)
+        n = doc.page_count
+        boundary = n
+        for i in range(n // 2, n):
+            t = doc[i].get_text()
+            # a day-agenda page may MENTION the mock in its budget line
+            # ("§12 mock 40 min") - the real exam section never carries
+            # LEARN/DRILL headers, so require their absence too
+            if (EXAM_SECTION_RE.search(t[:400])
+                    and not re.search(r"\b(LEARN|DRILL)\b", t)):
+                boundary = i
+                break
+        opt_pages = set()
+        caps_opt = re.compile(r"\bOPTIONAL\b")     # section headers, not prose
+        for i in range(boundary):
+            t = doc[i].get_text()
+            # [1-9]\d? and the <=30 cap keep scientific-notation debris like
+            # "E76" or "E00" in body text out of the census
+            for m in re.finditer(r"\b([DE][1-9]\d?)\b", t):
+                if int(m.group(1)[1:]) <= 30:
+                    pages_of.setdefault(m.group(1), set()).add(i)
+            if OPTIONAL_PAGE_RE.search(t) or caps_opt.search(t):
+                opt_pages.add(i)
+            for m in OPTIONAL_RANGE_RE.finditer(t):
+                for k in range(int(m.group(1)), int(m.group(2)) + 1):
+                    excluded.add("D%d" % k)
+        doc.close()
+        for lab, pgs in pages_of.items():
+            if pgs and pgs <= opt_pages:
+                excluded.add(lab)
+    except Exception:
+        pass
+    keep = [l for l in pages_of if l not in excluded]
+    return sorted(keep, key=lambda l: (l[0], int(l[1:])))
+
+
+# Progress is DRILL-based and lives in a human-readable checklist per workbook:
+# .rm_progress/<wb>.md. The first grey "update progress" builds it with an
+# agent audit of the inked pages; from then on the marker ticks drills live
+# (a drill counts only at FULL marks) and rescans just re-audit.
+PROG_DIR = os.path.join(HERE, ".rm_progress")
+
+
+def prog_path(wb):
+    return os.path.join(PROG_DIR, wb + ".md")
+
+
+def prog_load(wb):
+    """-> (drill list or None if no file yet, set of completed drills)."""
+    try:
+        txt = io.open(prog_path(wb), encoding="utf-8").read()
+    except Exception:
+        return None, set()
+    drills, done = [], set()
+    for m in re.finditer(r"^- \[(x| )\] ([DE]\d+)", txt, re.M):
+        lab = m.group(2)
+        drills.append(lab)
+        if m.group(1) == "x":
+            done.add(lab)
+    return (drills or None), done
+
+
+def prog_save(wb, drills, done):
+    os.makedirs(PROG_DIR, exist_ok=True)
+    lines = ["# Drill progress - %s" % wb, "",
+             "Updated %s. A drill is ticked only when it has achieved FULL "
+             "marks. Hand-editable; grey 'update progress' re-audits."
+             % time.strftime("%d %b %H:%M"), ""]
+    lines += ["- [%s] %s" % ("x" if lab in done else " ", lab) for lab in drills]
+    with io.open(prog_path(wb), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def prog_info(drills, done):
+    return {"done": len(done), "total": len(drills), "unit": "drills",
+            "pct": int(round(100.0 * len(done) / max(1, len(drills)))),
+            "ts": time.strftime("%d %b %H:%M")}
+
+
+def prog_tick(state, wb, labels, pdf_path=None):
+    """Mark items complete (idempotent) and refresh every progress surface."""
+    drills, done = prog_load(wb)
+    if drills is None:
+        drills = drill_list(pdf_path) if pdf_path else []
+    fresh = [l for l in labels if l not in done]
+    if fresh:
+        WEB.add_drills(len(fresh))     # session counter: first-time ticks only
+    for lab in labels:
+        if lab not in drills:
+            drills = sorted(set(drills) | {lab},
+                            key=lambda l: (l[0], int(l[1:])))
+        done.add(lab)
+    prog_save(wb, drills, done)
+    info = prog_info(drills, done)
+    state.setdefault("progress", {})[wb] = info
+    WEB.set_progress(wb, info)
+    return info
+
+
+_drill_cache = {}
+
+
+def refresh_modules():
+    """Whole-module totals across every workbook in the map - drills only,
+    exam questions never counted. Unscanned workbooks contribute their full
+    drill count as not-done (PDF text-scanned once, then cached), so the
+    module bar is honest about the road ahead."""
+    try:
+        agg = {}
+        for wb, (pdf_rel, _brief) in WORKBOOKS.items():
+            module = pdf_rel.split("/")[0]
+            drills, done = prog_load(wb)
+            if drills is None:
+                if wb not in _drill_cache:
+                    _drill_cache[wb] = drill_list(
+                        os.path.join(STUDY, pdf_rel.replace("/", os.sep)))
+                drills, done = _drill_cache[wb], set()
+            if not drills:
+                # an empty census means the PDF was unreadable - counting it
+                # as zero total would silently inflate the module bar
+                log("  !! %s: census EMPTY (pdf unreadable?) - module bar "
+                    "will overstate progress until fixed" % wb)
+            WEB.set_progress(wb, prog_info(drills, done))
+            a = agg.setdefault(module, {"done": 0, "total": 0})
+            a["done"] += len(done)
+            a["total"] += len(drills)
+        for a in agg.values():
+            a["pct"] = int(round(100.0 * a["done"] / max(1, a["total"])))
+        WEB.set_modules(agg)
+    except Exception as e:
+        log("     module progress refresh failed: %s" % str(e)[:80])
+
+
+PROGRESS_SCAN_PROMPT = u"""You are auditing a student's workbook for completion.
+Workbook: {wb}. Countable items (drills D<n> and exercises E<n>): {drills}.
+The marking notes (every drill's answer and marking logic) are here - Read this file first:
+{brief}
+
+Then Read each page render below. They show the printed workbook page with the
+student's handwriting overlaid:
+{pages}
+
+For each item, decide whether the visible written answer is COMPLETE and would
+earn FULL marks against the marking notes. Be strict: partially answered,
+partially correct, or unattempted all count as NOT complete.
+Output ONLY lines of the form "D3: complete" or "E2: complete" for items at
+full marks - no commentary, nothing else. If none qualify, output NONE."""
+
+
+def progress_scan(doc_uuid, order, wb_key, pdf_path, brief_path, state, dry=False):
+    """Grey 'update progress'. First run is the expensive one: renders every
+    inked content page and has the marking model judge which drills are at
+    full marks. Later runs re-audit the same way but keep already-ticked
+    drills (the checklist only moves forward unless hand-edited)."""
+    drills, done = prog_load(wb_key)
+    if drills is not None:
+        # Checklist already exists: the expensive audit only ever runs ONCE.
+        # From here the marker ticks it live; re-running 'update progress'
+        # re-reports - but always re-syncs the census first, so a checklist
+        # written by an older census (or with a broken path) heals itself.
+        census = drill_list(pdf_path)
+        if census:
+            done = done & set(census)
+            drills = census
+        prog_save(wb_key, drills, done)
+        info = prog_info(drills, done)
+        state.setdefault("progress", {})[wb_key] = info
+        WEB.set_progress(wb_key, info)
+        return info, 0
+    drills = drill_list(pdf_path)
+    sizes = {}
+    # "|| true": a workbook with no ink has no .rm files, the glob matches
+    # nothing and stat exits 1 - that is an empty result, not an error
+    out = ssh("stat -c '%%s %%n' %s/%s/*.rm 2>/dev/null || true"
+              % (XOCHITL, doc_uuid))
+    for line in out.splitlines():
+        parts = line.strip().split(" ", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            sizes[os.path.splitext(os.path.basename(parts[1]))[0]] = int(parts[0])
+    inked = [i for i, pu in enumerate(order)
+             if sizes.get(pu, 0) >= PROGRESS_MIN_BYTES]
+    shots = []
+    for i in inked[:30]:
+        try:
+            local = os.path.join(WORK_DIR, order[i] + ".rm")
+            pull("%s/%s.rm" % (doc_uuid, order[i]), local)
+            full, _ = render(pdf_path, i, parse_strokes(local), crop=None)
+            p = os.path.join(WORK_DIR, "prog_%s_p%d.png" % (wb_key, i + 1))
+            full.save(p)
+            shots.append(p)
+        except Exception as e:
+            log("     progress render p%d failed: %s" % (i + 1, str(e)[:60]))
+    if shots and not dry:
+        mdl, eff = profile(state, "mark")
+        log("     progress audit: %d inked pages -> %s/%s" % (len(shots), mdl, eff))
+        try:
+            outp = run_claude(PROGRESS_SCAN_PROMPT.format(
+                wb=wb_key, drills=", ".join(drills) or "unknown",
+                brief=brief_path, pages="\n".join(shots)),
+                mdl, eff, tools="Read", timeout=600)
+            for m in re.finditer(r"\b([DE]\d{1,2})\b\s*:?\s*complete", outp, re.I):
+                done.add(m.group(1).upper())
+        except Stopped:
+            raise
+        except Exception as e:
+            log("     progress audit failed: %s" % str(e)[:100])
+    prog_save(wb_key, drills, done)
+    info = prog_info(drills, done)
+    state.setdefault("progress", {})[wb_key] = info
+    WEB.set_progress(wb_key, info)
+    return info, len(inked)
+
+
+def progress_scan_all(state, dry=False):
+    """Grey 'update progress': every mapped workbook, both modules. Workbooks
+    found on the tablet get the full ink audit; the rest get their checklist
+    (created empty if new). One shared progress file per workbook is the
+    ledger every marking agent ticks from then on."""
+    on_tablet = {}
+    try:
+        listing = ssh("ls %s" % XOCHITL, timeout=60)
+        uuids = sorted({x[:-9] for x in listing.split() if x.endswith(".metadata")})
+        for u in uuids:
+            try:
+                name, order = doc_info(u)
+            except Exception:
+                continue
+            k = lookup_key(name)
+            if k and k not in on_tablet:
+                on_tablet[k] = (u, order)
+    except Exception as e:
+        log("     tablet doc listing failed: %s" % str(e)[:80])
+    lines = []
+    for wb in sorted(WORKBOOKS):
+        pdf_rel, brief_rel = WORKBOOKS[wb]
+        pdf_path = os.path.join(STUDY, pdf_rel.replace("/", os.sep))
+        brief_path = os.path.join(STUDY, brief_rel.replace("/", os.sep))
+        if not os.path.exists(pdf_path):
+            continue
+        try:
+            if wb in on_tablet:
+                u, order = on_tablet[wb]
+                log("     progress: auditing %s" % wb)
+                info, _ = progress_scan(u, order, wb, pdf_path, brief_path,
+                                        state, dry=dry)
+            else:
+                drills, done = prog_load(wb)
+                if drills is None:
+                    drills, done = drill_list(pdf_path), set()
+                prog_save(wb, drills, done)
+                info = prog_info(drills, done)
+                state.setdefault("progress", {})[wb] = info
+                WEB.set_progress(wb, info)
+        except Stopped:
+            raise
+        except Exception as e:
+            # one broken workbook must never sink the other nine
+            log("     progress %s failed: %s" % (wb, str(e)[:90]))
+            lines.append("%s: scan failed - %s" % (wb, str(e)[:60]))
+            continue
+        lines.append("%s: %d/%d (%d%%)"
+                     % (wb, info["done"], info["total"], info["pct"]))
+    refresh_modules()
+    mods = WEB.snapshot().get("modules", {})
+    mline = "  ·  ".join("%s %d%% (%d/%d)"
+                         % (k, v["pct"], v["done"], v["total"])
+                         for k, v in sorted(mods.items()))
+    return lines, mline
+
+
 def doc_info(doc_uuid):
     """visibleName and the page-uuid -> index ordering, read from the tablet."""
     meta = json.loads(ssh("cat %s/%s.metadata" % (XOCHITL, doc_uuid)))
@@ -564,6 +870,57 @@ def split_memory(reply):
     """-> (reply without MEMORY lines, joined memory text)"""
     notes = [m.group(1).strip() for m in MEMORY_RE.finditer(reply)]
     return MEMORY_RE.sub("", reply).strip(), " ".join(notes).strip()
+
+
+# Blue-channel agents can attach source images: "ATTACH: <path> p<N>" lines are
+# stripped from the reply, the named PDF page (or image file) is rendered, and
+# it rides to the phone as an extra picture - so "the workbook mentions an
+# example it doesn't show" can be answered with the actual slide.
+ATTACH_RE = re.compile(r"^\s*ATTACH:\s*(.+?)(?:\s+p(?:age)?\.?\s*(\d+))?\s*$", re.M)
+ATTACH_MAX = 2
+
+
+# The marker ticks the drill checklist with a hidden line, full marks only.
+PROGRESS_RE = re.compile(r"^\s*PROGRESS:\s*([DE]\d{1,2})\s*complete\s*\.?\s*$",
+                         re.I | re.M)
+
+
+def split_progress(reply):
+    """-> (reply without PROGRESS lines, [item labels now complete])"""
+    labs = [m.group(1).upper() for m in PROGRESS_RE.finditer(reply)]
+    return PROGRESS_RE.sub("", reply).strip(), labs
+
+
+def split_attach(reply):
+    """-> (reply without ATTACH lines, [(rel_path, page_or_None), ...])"""
+    reqs = [(m.group(1).strip().strip('"'),
+             int(m.group(2)) if m.group(2) else None)
+            for m in ATTACH_RE.finditer(reply)]
+    return ATTACH_RE.sub("", reply).strip(), reqs[:ATTACH_MAX]
+
+
+def render_attachment(rel, pageno):
+    """One PNG for an ATTACH request. Path must stay inside STUDY; PDFs are
+    rendered at 2.5x, existing images pass through. Returns None on refusal."""
+    p = os.path.normpath(os.path.join(STUDY, rel.replace("/", os.sep)))
+    if not p.startswith(os.path.normpath(STUDY) + os.sep) or not os.path.exists(p):
+        log("     ATTACH refused or missing: %s" % rel)
+        return None
+    ext = os.path.splitext(p)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg"):
+        return p
+    if ext == ".pdf":
+        try:
+            doc = pymupdf.open(p)
+            i = min(max(1, pageno or 1), doc.page_count) - 1
+            out = os.path.join(WORK_DIR, "attach_%s_p%d.png"
+                               % (re.sub(r"\W+", "_", os.path.basename(p))[:40], i + 1))
+            doc[i].get_pixmap(matrix=pymupdf.Matrix(2.5, 2.5)).save(out)
+            doc.close()
+            return out
+        except Exception as e:
+            log("     ATTACH render failed (%s): %s" % (rel, str(e)[:80]))
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -751,9 +1108,8 @@ def find_question(module, q, hint=None):
                   if all(tk in os.path.basename(f).lower() for tk in toks)]
         cands = hinted or cands            # a hint that matches nothing is ignored
     # Default preference: example paper, then questions-only papers, then
-    # with-answers rebuilds, and real-sitting exports (the student's own
-    # uncorrected answers embedded) or cohort feedback only if named by hint
-    # or nothing else matches.
+    # with-answers rebuilds, and any real-sitting export (the student's own wrong answers
+    # embedded) or cohort feedback only if named by hint or nothing else matches.
     def rank(f):
         n = os.path.basename(f).lower()
         if "example" in n:
@@ -839,7 +1195,7 @@ def guess_question(pdf_path, page_idx, bbox=None):
 def page_shot(pdf_path, page_idx, bbox=None):
     """Clean high-res renders of the source page - the PDF's own pixels, no ink.
     For when the tablet mangles a question's display. Returns [region?, full],
-    region first so the thing he asked about is the primary attachment."""
+    region first so the thing they asked about is the primary attachment."""
     doc = pymupdf.open(pdf_path)
     page = doc[page_idx]
     pw, ph = page.rect.width, page.rect.height
@@ -847,7 +1203,7 @@ def page_shot(pdf_path, page_idx, bbox=None):
     shots = []
     if bbox:
         x0, y0, x1, y1 = bbox
-        # taller than a written word = he circled a region, so crop to it
+        # taller than a written word = they circled a region, so crop to it
         if (y1 - y0) > 180:
             r = pymupdf.Rect(max(0, s * x0 + pw / 2 - 15), max(0, s * y0 - 15),
                              min(pw, s * x1 + pw / 2 + 15), min(ph, s * y1 + 15))
@@ -867,7 +1223,7 @@ def page_shot(pdf_path, page_idx, bbox=None):
 HEADER = u"[{workbook} | page {pageno} | {tag}] {colour} ink -> {action}"
 
 PROMPT = u"""You are tutoring a student for the {module} module through a workbook.
-Exam: {exam}.
+Exam: {exam}. It is OPEN BOOK with internet access, no generative AI.
 You will get several requests from this workbook in a row; keep the context.
 
 --- WHAT YOU ALREADY KNOW ABOUT THE STUDENT (earlier sessions) ---
@@ -900,17 +1256,39 @@ Rules:
 - Hold them to exam discipline: justify claims, show working, answer the question
   actually asked.
 - Reply with the feedback ONLY - no preamble, no "here is my feedback". Under
-  200 words. Plain text, no markdown headers.
+  200 words. Plain text, no markdown headers. Write ALL mathematics as LaTeX
+  between $...$ (inline) or $$...$$ (display) - their dashboard renders it
+  properly; never use unicode maths symbols or ascii-art fractions.
 - Start with a single line of the form: VERDICT: <short summary, max 8 words>
   (for marking include the mark, e.g. "VERDICT: D4(a) 3/5 - method right, arithmetic slip")
+- After marking: if the drill or exercise you marked has NOW earned full marks
+  on every part it contains, add one final line exactly: PROGRESS: <id> complete
+  where <id> is its label, e.g. D4 or E2 (nothing else on the line). Partial
+  marks or unmarked parts -> no line. It is stripped before they see the reply;
+  it ticks their progress bar.
 {memrule}"""
 
-MEMRULE = u"""- Finally, if and only if you learned something durable about how they work,
+MEMRULE = u"""- Finally, if and only if you learned something durable about how the student works,
   add ONE last line: MEMORY: <observation>. Record PATTERNS, not events -
   "drops nodes from the frontier when tracing by hand" or "solid on admissibility
   arguments", never "scored 2/5 on D3". A pattern is still true next week; a score
   is not. Skip the line entirely if nothing durable came up - most requests should
   not produce one. This line is stripped before they see the reply.
+"""
+
+# Only the blue channel gets this (appended to {memrule} for explain/tutor/
+# deep): it may deliberately override the "no other tool call" default when a
+# real slide is worth showing.
+ATTACH_RULE = u"""- If SEEING the actual source would genuinely help - the workbook names an
+  example or figure it does not show, or a diagram carries the idea - you MAY
+  use your file tools to locate the source PDF, then add one line per image at
+  the VERY END of your reply:  ATTACH: <path relative to the study root> p<N>
+  e.g. "ATTACH: MODULE-A/pdf/lectures/week-06-lighting.pdf p14".
+  Lecture markdown files carry their exact source PDF path in a "> Source:"
+  line near the top, and note slide numbers as they go. At most 2. The page is
+  rendered and sent to the student's phone with your reply; mention in the text
+  what each attached image shows. Never guess a path - only name a file you
+  have confirmed exists. These lines are stripped before the student sees the reply.
 """
 
 TASKS = {
@@ -924,24 +1302,29 @@ TASKS = {
 # Grey "tutor" swaps the explain task for this. The standard rules still arrive
 # with every prompt, so the override has to name which of them stop applying -
 # otherwise the 200-word cap and the circled-work-only rule quietly win.
-TUTOR_TASK = u"""FULL-TUTOR MODE. This is a question to the student's personal tutor, and the
-following overrides the standard rules where they conflict:
+TUTOR_TASK = u"""FULL-TUTOR MODE. This is a question to the student's personal tutor, and the following
+overrides the standard rules where they conflict:
 - The blue handwriting is the question; the circle only anchors where they are.
   The question may be about ANYTHING - this module, exam strategy, their past
   performance - so answer the question actually asked, not the circled drill.
 - You have Read, Grep and Glob over the whole study tree. Start from:
-    {module_root}/md/   converted study materials, if present
-    the workbook PDFs and marking-notes files named in the WORKBOOKS map
+    {module_root}/md/lectures/week-*/   the lectures as markdown
+    {module_root}/md/practice/          every practice paper and answer set
+    {module_root}/workbooks/tutor-*.md  drill answers + marking logic
   Go and read what the question needs; never answer a question about their own
   past work without opening the file that holds it.
+- CAUTION: if the corpus holds a real first-sitting export, its recorded
+  answers are preserved MISTAKES by design. Judge them against the
+  tutor-derived blocks only; never quote one as a model answer.
 - The 200-word cap is lifted: up to 600 words when the question deserves it.
 - Everything else stands: strict standards, exam discipline, say it differently
   from the workbook, end with one check question, and the first line is still
   "VERDICT: <max 8 words>"."""
 
 DEEP_PROMPT = u"""You are a student's deep-dive tutor for the {module} module (exam {exam}).
-They have enabled DEEP explain because they are STRUGGLING with something complex and
-want as much perspective as possible. Take your time - depth is the point.
+They have enabled DEEP explain because they are
+STRUGGLING with something complex and wants as much perspective as possible. Take your
+time - depth is the point.
 
 {header}
 
@@ -966,11 +1349,12 @@ Then write the explanation, structured as:
 1. The core idea in one short paragraph, in DIFFERENT words from the workbook.
 2. Two or three genuinely different angles - an analogy, a worked micro-example with
    fresh small numbers, or the design problem this idea was invented to solve.
-3. Where this shows up in THEIR exam and what the marks are actually awarded for.
+3. Where this shows up in HIS exam and what the marks are actually awarded for.
 4. The misconception most likely causing their confusion, named plainly.
 5. One check question.
 
-Under 600 words, plain text, no markdown headers.
+Under 600 words, plain text, no markdown headers. Write all mathematics as
+LaTeX between $...$ or $$...$$ - their dashboard renders it.
 First line exactly: "VERDICT: deep dive - <topic, max 6 words>".
 {memrule}"""
 
@@ -986,10 +1370,46 @@ def claude_exe():
     raise RuntimeError("claude CLI not found on PATH")
 
 
+# Dashboard STOP button. Jobs run one at a time on the main loop, so a single
+# event + a single tracked Popen is all the machinery needed: the web thread
+# sets the flag and kills the process; the main loop sees Stopped, marks the
+# trigger as answered (i.e. the prompt is IGNORED, not retried) and moves on.
+class Stopped(Exception):
+    """The dashboard STOP button aborted this job - not an error."""
+
+
+STOP_EVT = threading.Event()
+_LIVE_PROC = {"p": None}
+_LIVE_LOCK = threading.Lock()
+
+
+def request_stop():
+    """-> True if a job was running (flag set + agent killed), else False."""
+    with WEB.lock:
+        busy = bool(WEB.jobs)
+    if not busy:
+        return False
+    STOP_EVT.set()
+    with _LIVE_LOCK:
+        p = _LIVE_PROC["p"]
+        if p and p.poll() is None:
+            try:
+                if os.name == "nt":
+                    # claude is a .cmd shim whose node child survives a bare
+                    # kill() and keeps the stdout pipe open - kill the tree
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True)
+                else:
+                    p.kill()
+            except Exception:
+                pass
+    return True
+
+
 def session_args(state, wb_key):
     """One live conversation per workbook.
 
-    Switching workbook ends the previous conversation (a deliberate choice),
+    Switching workbook ends the previous conversation (the user's stated preference),
     which also stops context growing without bound. Staying in one workbook
     resumes, so follow-ups keep the tutoring context AND hit the prompt cache -
     the second question on a page is markedly faster than the first.
@@ -1002,6 +1422,7 @@ def session_args(state, wb_key):
                 % (state.get("active_wb"), wb_key))
         state["active_wb"] = wb_key
         state["sessions"] = {}
+        state["sess_n"] = {}
         state["last_page"] = None
     sid = state.setdefault("sessions", {}).get(wb_key)
     if sid:
@@ -1011,35 +1432,81 @@ def session_args(state, wb_key):
     return ["--session-id", sid], True
 
 
+def cmd_session_args(state):
+    """Persistent conversation for the grey channel, mirroring the workbook
+    sessions: resuming keeps the CLI's prompt cache warm so transcriptions
+    stop paying the cold-start price on every command. Rotated every 12
+    commands so the accumulated page images never bloat the context.
+    Returns (cli_args, is_new_session)."""
+    import uuid as _uuid
+    sid = state.get("cmd_session")
+    if not sid or state.get("cmd_n", 0) >= 12:
+        sid = str(_uuid.uuid4())
+        state["cmd_session"] = sid
+        state["cmd_n"] = 0
+        return ["--session-id", sid], True
+    return ["--resume", sid], False
+
+
 def run_claude(prompt, model, effort=EFFORT_DEFAULT, tools="Read Grep",
                timeout=CLAUDE_TIMEOUT, extra=None):
     # The prompt goes in on STDIN, not as an argument. claude is a .cmd shim, so
     # argv passes through cmd.exe and hits the 8191-char Windows command-line
     # limit - which anything with an inlined brief excerpt comfortably exceeds.
-    cmd = [claude_exe(), "-p", "--model", model, "--effort", effort]
-    # Headless agents may only read below their cwd (here: scripts\). Grant the
-    # whole study tree, or any "look at file X" request gets a file-access
+    # json output wraps the reply with exact token usage - the dashboard's
+    # session panel is fed from it; the text itself is in the "result" field
+    cmd = [claude_exe(), "-p", "--output-format", "json",
+           "--model", model, "--effort", effort]
+    # Headless agents may only read below their cwd (here: workbooks\). Grant
+    # the whole Study tree, or "feedback on my exam work" gets a file-access
     # denial - the tools are read-only, so this is safe.
     cmd += ["--add-dir", STUDY]
     if tools:
         cmd += ["--allowedTools", tools]
     if extra:
         cmd += list(extra)
+    if STOP_EVT.is_set():        # stop pressed while the page was still rendering
+        raise Stopped()
     t0 = time.time()
+    # Popen rather than run() so the dashboard STOP button can kill the
+    # in-flight agent from the web thread.
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace")
+    with _LIVE_LOCK:
+        _LIVE_PROC["p"] = p
     try:
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                           timeout=timeout, encoding="utf-8", errors="replace")
+        out_s, err_s = p.communicate(prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            p.communicate(timeout=10)
+        except Exception:
+            pass
         # the default message dumps the entire command line, which is useless
         # in a phone notification
         raise RuntimeError("timed out after %ds (%s/%s)" % (timeout, model, effort))
-    out = (r.stdout or "").strip()
+    finally:
+        with _LIVE_LOCK:
+            _LIVE_PROC["p"] = None
+    if STOP_EVT.is_set():
+        raise Stopped()
+    out = (out_s or "").strip()
     log("     (%s/%s, %.1fs)" % (model, effort, time.time() - t0))
-    if r.returncode != 0 or not out:
-        msg = (r.stderr or out or "no output").strip()[:300]
+    if p.returncode != 0 or not out:
+        msg = (err_s or out or "no output").strip()[:300]
         if "authenticate" in msg.lower() or "oauth" in msg.lower():
             msg += "  ->  run `claude` in a terminal and sign in, then retry"
         raise RuntimeError(msg)
+    try:
+        j = json.loads(out)
+    except ValueError:
+        j = None
+    if isinstance(j, dict) and "result" in j:
+        WEB.add_tokens(j.get("usage") or {}, j.get("total_cost_usd"))
+        out = (j["result"] or "").strip()
+        if j.get("is_error") or not out:
+            raise RuntimeError((out or "agent returned an error")[:300])
     return out
 
 
@@ -1077,7 +1544,52 @@ Same rules as before. Under 200 words, first line "VERDICT: ...".
 {memrule}"""
 
 
+# A workbook conversation is resumed request after request, and every request
+# adds a page image - left alone it grows for the whole sitting. After this
+# many requests it is compacted: the old conversation writes a handover
+# (final outcomes only, but the student's errors along the way are KEPT), then a fresh
+# session starts with that handover in its opening prompt.
+COMPACT_AFTER = 10
+
+COMPACT_PROMPT = u"""This tutoring conversation is being compacted; a fresh one
+takes over from your handover. Write it now, 150 words maximum, plain text, no
+preamble:
+1. Each drill/exercise touched, with its FINAL state only (latest mark or
+   explanation outcome). Where something was marked or re-explained several
+   times, keep only the last result - drop the superseded attempts.
+2. The specific errors the student made along the way, kept even where they later
+   fixed them - these are the most valuable part of the handover.
+3. Any standing instructions or preferences stated during the conversation."""
+
+
+def compact_session(state, wb_key):
+    """-> handover text (or None). Ends the workbook's current conversation
+    either way; the caller's next session_args() starts a fresh one."""
+    sid = state.get("sessions", {}).get(wb_key)
+    summary = None
+    if sid:
+        try:
+            summary = run_claude(COMPACT_PROMPT, "sonnet", "low", tools="Read",
+                                 timeout=120, extra=["--resume", sid])
+        except Exception as e:
+            log("     compact failed (%s) - rotating without handover"
+                % str(e)[:60])
+    state.get("sessions", {}).pop(wb_key, None)
+    state.get("sess_n", {}).pop(wb_key, None)
+    return summary
+
+
 def ask_claude(ctx, model, effort, state, wb_key, dry=False):
+    n = state.setdefault("sess_n", {}).get(wb_key, 0)
+    if (not dry and n >= COMPACT_AFTER
+            and state.get("sessions", {}).get(wb_key)):
+        log("     compacting %s conversation after %d requests" % (wb_key, n))
+        handover = compact_session(state, wb_key)
+        if handover:
+            ctx["memory"] = (ctx["memory"] +
+                "\n\n--- HANDOVER from your previous conversation on this "
+                "workbook (compacted: final outcomes; their errors along the "
+                "way are kept deliberately) ---\n" + handover)
     args, is_new = session_args(state, wb_key)
     same_page = (not is_new) and state.get("last_page") == (wb_key, ctx["pageno"])
 
@@ -1104,12 +1616,15 @@ def ask_claude(ctx, model, effort, state, wb_key, dry=False):
         if not is_new and "resume" in (" ".join(args) + str(e)).lower():
             log("     resume failed, starting a fresh conversation")
             state["sessions"].pop(wb_key, None)
+            state.get("sess_n", {}).pop(wb_key, None)
             args, _ = session_args(state, wb_key)
             prompt = PROMPT.format(task=task, **ctx)
             out = run_claude(prompt, model, effort, tools="Read Grep Glob", extra=args)
         else:
             raise
     state["last_page"] = (wb_key, ctx["pageno"])
+    state.setdefault("sess_n", {})[wb_key] = \
+        state.get("sess_n", {}).get(wb_key, 0) + 1
     return out
 
 
@@ -1145,10 +1660,14 @@ def classify(text):
         return "set-effort", ("high", scope)
     if re.search(r"\bthink less\b|\bless thinking\b|\bfaster\b|\bquicker\b", t):
         return "set-effort", ("low", scope)
+    if re.search(r"\bguide\b|\bhow (?:do|to) i\b|\bgetting started\b", t):
+        return "guide", None
     if re.search(r"\bhelp\b|\bcommands?\b|\bwhat can you do\b", t):
         return "help", None
-    if re.search(r"\brestart\b|\breboot\b|\breload\b", t):
+    if re.search(r"\brestart\b|\breboot\b|\breload\b|\breset\b", t):
         return "restart", None
+    if re.search(r"\bprogress\b", t):
+        return "progress", None
     if re.search(r"\bscreen ?shot\b|\bpng\b|\bphoto\b|\bpicture\b|\bsnap\b"
                  r"|\bsend\b.*\b(page|question)\b", t):
         # "screenshot q12 example exam" -> fetch Question 12 from a source paper.
@@ -1169,6 +1688,17 @@ def classify(text):
     if re.search(r"\btutor\w*\b", t):
         off = bool(re.search(r"\boff\b|\bdisable\b|\bstop\b|\bnormal\b|\bquick\b", t))
         return "tutor", ("off" if off else "on")
+    # patience mode: 'wait' holds coloured ink, 'begin' fires everything held
+    if re.search(r"\bwait\b|\bhold\b|\bpatience\b", t):
+        return "wait", None
+    if re.search(r"\bbegin\b|\bexecute\b|\bfire\b", t):
+        return "begin", None
+    # "start timer 25" / "timer 90" - any number of minutes
+    m = re.search(r"\btimer\b\D{0,12}(\d{1,3})", t)
+    if m:
+        return "timer", int(m.group(1))
+    if re.search(r"\bwhite\s*rabbit\b", t):
+        return "rabbit", None
     if re.search(r"\beffort\b|\bthinking\b", t):
         return "get-model", None          # asking about effort -> report both
     if re.search(r"\bmodel\b|\bmodle\b", t):
@@ -1186,7 +1716,7 @@ blue circle = explain it; blue handwriting = your question
 grey = commands (this list). Erase circles once answered.
 
 FETCH A QUESTION IMAGE
-'screenshot q12' - Question 12 from the default paper
+'screenshot q<N>' - Question N (any number) from the default paper
 'screenshot q1 real' / 'q3 game theory' / 'q1 formative' - name the paper
 'screenshot from the exam paper' - infers the question from the page you're on
 'screenshot' alone + a grey circle - renders the circled region of THIS page
@@ -1204,26 +1734,74 @@ whole corpus (several minutes each). 'deep off' - back to quick explains.
 
 FULL TUTOR
 'tutor' - blue handwriting becomes a question to your tutor: it reads
-anything in the study tree and answers at length - not limited to the
-circled work. Stays in the same conversation, so follow-ups build on it.
-'tutor off' - quick explains.
+anything in the study tree (lectures, past papers, your real exam) and
+answers at length - not limited to the circled drill. Stays in the same
+conversation, so follow-ups build on it. 'tutor off' - quick explains.
+Blue answers can also ATTACH images - ask e.g. 'show me the slide with
+the worked example' in blue and the lecture page arrives as a PNG.
+
+LONG PROMPTS (patience mode)
+'wait' - hold fire: coloured ink is queued, not answered, while you keep
+writing - across pages if you like. Grey commands still work.
+'begin' - execute everything added since 'wait'.
+
+PROGRESS + DASHBOARD
+'update progress' - audits this workbook's ink against the marking notes
+and rebuilds its DRILL checklist (.rm_progress/<wb>.md). A drill counts
+only at FULL marks; exam/mock questions never count. After the first
+audit the marker ticks drills automatically as they reach full marks.
+Dashboard: http://localhost:8477 on the machine running the watcher -
+live feed, working lights, workbook bar (hover it for module totals).
 
 SYSTEM
+'start timer 25' - countdown (any minutes) at the top of the dashboard
+'guide' - the 60-second how-to
 'status' - models, deep on/off, requests answered, active workbook
 'restart' - relaunch the watcher with the latest code
 'help' - this list"""
 
+GUIDE_TEXT = u"""HOW TO USE THIS - the 60-second guide
 
-def handle_command(crop_png, state, dry=False, page=None):
+1. Work in BLACK in the workbook, exactly as on paper.
+2. Finished a drill? Circle your answer in RED and turn the page (the
+   page-turn makes the tablet save the ink). ~30s later your phone gets
+   the mark and exactly where marks were lost. Erase the circle once read.
+3. Stuck? Circle the drill in BLUE for a fresh explanation - or WRITE a
+   question in blue and it gets answered directly. Write 'tutor' in grey
+   first and blue questions can be about anything, at length.
+4. GREY steers the machine - 'help' lists every command.
+5. Full-mark drills tick the progress bars by themselves. The dashboard
+   (http://localhost:8477 on the watcher machine) shows replies with
+   proper maths, live statuses, and progress.
+
+Black to work - red to be marked - blue to ask - grey to steer."""
+
+
+def handle_command(crop_png, state, dry=False, page=None, doc=None):
     """Grey ink is a control channel, not a question. Always read with the
     fastest model so switching away from a slow one is itself quick.
     `page` = (pdf_path, page_idx, grey_bbox) so screenshot requests can render
-    from the source PDF. Screenshots are handed back via state["_shots"]."""
+    from the source PDF. Screenshots are handed back via state["_shots"].
+    `doc` = (doc_uuid, page_order, wb_key, pdf_path, brief_path) for the
+    progress scan."""
     if dry:
         log("DRY-RUN command read of %s" % crop_png)
         return "(dry run)", "cmd"
-    raw = run_claude(CMD_PROMPT.format(png=crop_png), COMMAND_MODEL,
-                     COMMAND_EFFORT, tools="Read", timeout=120)
+    args, fresh = cmd_session_args(state)
+    try:
+        raw = run_claude(CMD_PROMPT.format(png=crop_png), COMMAND_MODEL,
+                         COMMAND_EFFORT, tools="Read", timeout=120, extra=args)
+    except RuntimeError as e:
+        # a resume can fail if the transcript was cleaned up - start over once
+        if not fresh and "resume" in str(e).lower():
+            state.pop("cmd_session", None)
+            args, _ = cmd_session_args(state)
+            raw = run_claude(CMD_PROMPT.format(png=crop_png), COMMAND_MODEL,
+                             COMMAND_EFFORT, tools="Read", timeout=120,
+                             extra=args)
+        else:
+            raise
+    state["cmd_n"] = state.get("cmd_n", 0) + 1
     # the transcription is normally the whole reply; if the model added chatter,
     # the shortest non-empty line is almost always the transcription itself
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -1247,6 +1825,7 @@ def handle_command(crop_png, state, dry=False, page=None):
         value, scope = arg
         field = "model" if kind == "set-model" else "effort"
         where = apply(field, value, scope)
+        web_profiles(state)
         return ("%s %s -> %s\n\nNow: %s\n\nScope it by saying 'explain opus' or "
                 "'mark haiku'; unscoped changes both."
                 % (where, field, value, describe())), "%s %s=%s" % (where, field, value)
@@ -1254,13 +1833,43 @@ def handle_command(crop_png, state, dry=False, page=None):
         return (describe() + "\n\nIn grey: 'model opus', 'explain opus', "
                 "'mark sonnet', 'effort high', 'think harder', 'faster'."), describe()
     if kind == "status":
-        return ("%s\nDEEP explain: %s. Full tutor: %s. %d requests answered. "
-                "Watching %d pages. Active workbook: %s."
+        return ("%s\nDEEP explain: %s. Full tutor: %s. Patience (wait): %s. "
+                "%d requests answered. Watching %d pages. Active workbook: %s."
                 % (describe(), "ON" if state.get("deep") else "off",
                    "ON" if state.get("tutor") else "off",
+                   "HOLDING" if state.get("waiting") else "off",
                    len(state.get("answered", [])),
                    len(state.get("mtimes", {})),
                    state.get("active_wb") or "none")), "status"
+    if kind == "timer":
+        mins = max(1, min(600, arg))
+        WEB.set_timer(mins)
+        return ("Timer started: %d minute%s. Counting down at the top of the "
+                "dashboard - when it hits zero you choose continue or break."
+                % (mins, "" if mins == 1 else "s")), "timer %dm" % mins
+    if kind == "rabbit":
+        WEB.set_rabbit()
+        return "Knock, knock, Neo.", "..."
+    if kind == "wait":
+        state["waiting"] = True
+        state["wait_seen"] = []
+        return ("PATIENCE ON. Coloured ink is held from here - write and edit "
+                "across as many pages as you like. Nothing fires until you "
+                "write 'begin' in grey; then everything added since this "
+                "'wait' is executed."), "waiting for 'begin'"
+    if kind == "begin":
+        was = state.pop("waiting", False)
+        held = len(state.pop("wait_seen", []) or [])
+        if not was:
+            return ("'wait' was not active - nothing was being held. Coloured "
+                    "ink fires as normal."), "not waiting"
+        return ("GO. Patience off - %s."
+                % (("firing the %d held trigger%s now"
+                    % (held, "" if held == 1 else "s")) if held
+                   else "no held ink found; new circles fire as normal")), \
+               "begin - %d held" % held
+    if kind == "guide":
+        return GUIDE_TEXT, "the 60-second guide"
     if kind == "help":
         return HELP_TEXT, "command list"
     if kind == "screenshot":
@@ -1276,8 +1885,7 @@ def handle_command(crop_png, state, dry=False, page=None):
             q = guess_question(page[0], page[1], page[2])
             inferred = q is not None
         if q:
-            default_mod = next(iter(QUESTION_DIRS), "")
-            module = (page or (None, None, None, default_mod))[3]
+            module = (page or (None, None, None, next(iter(QUESTION_DIRS), "")))[3]
             found = find_question(module, q, hint)
             if found:
                 state["_shots"], desc = found
@@ -1305,6 +1913,14 @@ def handle_command(crop_png, state, dry=False, page=None):
                 "a question from an exam paper instead, write e.g. 'screenshot q12' "
                 "or 'screenshot q3 game theory quiz'."
                 % (len(shots), "" if len(shots) == 1 else "s")), "page screenshot"
+    if kind == "progress":
+        lines, mline = progress_scan_all(state, dry=dry)
+        return ("MODULES:  %s\n\n%s\n\nDrills and mid-book exercises count; "
+                "untimed extras and exam/mock questions never do. A drill "
+                "ticks only at FULL marks. Checklists: .rm_progress/<wb>.md - "
+                "the marker updates them automatically from here on."
+                % (mline, "\n".join(lines))), \
+               ("progress: %s" % mline)[:120]
     if kind == "restart":
         # actual respawn happens in the main loop AFTER this trigger is recorded
         # as answered and state is saved - otherwise the new process re-fires on
@@ -1313,8 +1929,9 @@ def handle_command(crop_png, state, dry=False, page=None):
         return ("Restarting the watcher now. Back in ~15 s with the current code. "
                 "Conversation and model defaults reset; memory file kept."), "restarting"
     if kind == "deep":
+        state["deep"] = (arg == "on")
+        web_profiles(state)
         if arg == "on":
-            state["deep"] = True
             return ("DEEP explain enabled. Blue circles now go to a standalone %s "
                     "agent at %s effort that reads the whole converted corpus - "
                     "expect several minutes per answer. Red marking is unaffected. "
@@ -1324,12 +1941,14 @@ def handle_command(crop_png, state, dry=False, page=None):
         return ("DEEP explain off - blue circles back to %s/%s quick explains."
                 % profile(state, "explain")), "DEEP explain off"
     if kind == "tutor":
+        state["tutor"] = (arg == "on")
+        web_profiles(state)
         if arg == "on":
-            state["tutor"] = True
             return ("FULL TUTOR enabled (%s/%s). Blue handwriting is now a question "
                     "to your tutor: it reads whatever the question needs from the "
-                    "study tree and answers at length instead of only explaining "
-                    "the circled work. Red marking is unchanged. 'tutor off' "
+                    "study tree - lectures, practice papers, your real first "
+                    "sitting - and answers at length instead of only explaining "
+                    "the circled drill. Red marking is unchanged. 'tutor off' "
                     "returns to quick explains. (While 'deep explain' is on, it "
                     "still takes precedence for blue circles.)"
                     % profile(state, "explain")), "FULL TUTOR on"
@@ -1364,6 +1983,213 @@ def notify(title, body, image=None, priority="default", tags=None, dry=False):
 
 
 # --------------------------------------------------------------------------- #
+# local dashboard (read-only mirror; the ink stays the only control surface)
+# --------------------------------------------------------------------------- #
+DASH_PATH = os.path.join(HERE, "rm_dashboard.html")
+
+
+class WebState:
+    """Everything the dashboard shows. Content of grey commands is never
+    stored here - jobs carry only their kind, so the page can show a
+    '(working)' tag without seeing what was written."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.online, self.host = False, None
+        self.active_wb = None
+        self.jobs = {}
+        self.responses = []
+        self.progress = {}
+        self.modules = {}
+        self.profiles = {}
+        self.times = {}          # kind -> [secs...]; first = cache warm-up
+        self.session = {"started": None, "drills": 0, "tok_in": 0,
+                        "tok_out": 0, "tok_cache": 0, "cost": 0.0}
+        self.timer = None        # {"mins", "ts", "n"} - grey "start timer N"
+        self.rabbit = None       # {"n"} - they know what they wrote
+        self._next = 1
+
+    def set_timer(self, mins):
+        with self.lock:
+            self.timer = {"mins": mins, "ts": time.time(), "n": self._next}
+            self._next += 1
+
+    def set_rabbit(self):
+        with self.lock:
+            self.rabbit = {"n": self._next, "ts": time.time()}
+            self._next += 1
+
+    def set_session_start(self):
+        with self.lock:
+            self.session["started"] = time.strftime("%a %H:%M")
+
+    def add_drills(self, n):
+        with self.lock:
+            self.session["drills"] += n
+
+    def add_tokens(self, usage, cost=None):
+        with self.lock:
+            s = self.session
+            s["tok_in"] += (int(usage.get("input_tokens") or 0)
+                            + int(usage.get("cache_creation_input_tokens") or 0))
+            s["tok_cache"] += int(usage.get("cache_read_input_tokens") or 0)
+            s["tok_out"] += int(usage.get("output_tokens") or 0)
+            if cost:
+                s["cost"] = round(s["cost"] + float(cost), 4)
+
+    def set_online(self, ok, host=None):
+        with self.lock:
+            self.online, self.host = ok, host
+
+    def set_wb(self, wb):
+        with self.lock:
+            self.active_wb = wb
+
+    def job_start(self, kind, wb=None, page=None):
+        with self.lock:
+            jid = self._next
+            self._next += 1
+            self.jobs[jid] = {"kind": kind, "wb": wb, "page": page}
+            return jid
+
+    def job_end(self, jid):
+        with self.lock:
+            self.jobs.pop(jid, None)
+
+    def remove_response(self, rid):
+        with self.lock:
+            self.responses = [r for r in self.responses if r["id"] != rid]
+
+    def add_response(self, kind, wb, page, title, body, images=()):
+        import shutil
+        with self.lock:
+            rid = self._next
+            self._next += 1
+        webimgs = []
+        for i, img in enumerate([p for p in images if p and os.path.exists(p)]):
+            name = "web_%d_%d.png" % (rid, i)
+            try:
+                shutil.copyfile(img, os.path.join(WORK_DIR, name))
+                webimgs.append(name)
+            except Exception:
+                pass
+        with self.lock:
+            self.responses.append({"id": rid, "ts": time.strftime("%H:%M"),
+                                   "kind": kind, "wb": wb, "page": page,
+                                   "title": title, "body": body,
+                                   "images": webimgs})
+            del self.responses[:-80]
+
+    def set_progress(self, wb, info):
+        with self.lock:
+            self.progress[wb] = info
+
+    def set_modules(self, agg):
+        with self.lock:
+            self.modules = agg
+
+    def set_profiles(self, prof):
+        with self.lock:
+            self.profiles = prof
+
+    def add_time(self, kind, secs):
+        with self.lock:
+            self.times.setdefault(kind, []).append(round(secs, 1))
+
+    def snapshot(self):
+        with self.lock:
+            times = {k: {"n": len(v) - 1,
+                         "avg": (round(sum(v[1:]) / (len(v) - 1), 1)
+                                 if len(v) > 1 else None)}
+                     for k, v in self.times.items()}
+            return {"online": self.online, "host": self.host,
+                    "active_wb": self.active_wb,
+                    "jobs": [dict(v) for v in self.jobs.values()],
+                    "progress": dict(self.progress),
+                    "modules": dict(self.modules),
+                    "profiles": dict(self.profiles),
+                    "times": times,
+                    "session": dict(self.session),
+                    "timer": dict(self.timer) if self.timer else None,
+                    "rabbit": dict(self.rabbit) if self.rabbit else None,
+                    "responses": list(self.responses)}
+
+
+WEB = WebState()
+
+
+def web_profiles(state):
+    """Push the current per-channel model setup (and modes) to the dashboard."""
+    mm, me = profile(state, "mark")
+    em, ee = profile(state, "explain")
+    WEB.set_profiles({"mark": "%s/%s" % (mm, me),
+                      "explain": "%s/%s" % (em, ee),
+                      "command": "%s/%s" % (COMMAND_MODEL, COMMAND_EFFORT),
+                      "deep": bool(state.get("deep")),
+                      "tutor": bool(state.get("tutor"))})
+
+
+def start_web():
+    import http.server
+    import urllib.parse
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, ctype, data):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            try:
+                path = urllib.parse.urlparse(self.path).path
+                if path in ("/", "/index.html"):
+                    with open(DASH_PATH, "rb") as fh:
+                        self._send(200, "text/html; charset=utf-8", fh.read())
+                elif path == "/state":
+                    self._send(200, "application/json",
+                               json.dumps(WEB.snapshot()).encode("utf-8"))
+                elif path == "/del":
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(self.path).query)
+                    try:
+                        WEB.remove_response(int(q.get("id", ["0"])[0]))
+                    except Exception:
+                        pass
+                    self._send(200, "application/json", b'{"ok": true}')
+                elif path == "/stop":
+                    self._send(200, "application/json",
+                               json.dumps({"stopped": request_stop()})
+                               .encode("utf-8"))
+                elif path.startswith("/img/"):
+                    name = os.path.basename(path[5:])
+                    p = os.path.join(WORK_DIR, name)
+                    if name.endswith(".png") and os.path.exists(p):
+                        with open(p, "rb") as fh:
+                            self._send(200, "image/png", fh.read())
+                    else:
+                        self._send(404, "text/plain", b"not found")
+                else:
+                    self._send(404, "text/plain", b"not found")
+            except Exception:
+                pass
+
+    try:
+        srv = http.server.ThreadingHTTPServer((WEB_HOST, WEB_PORT), H)
+    except OSError as e:
+        log("dashboard NOT started (%s) - is port %d in use?" % (e, WEB_PORT))
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log("dashboard at http://%s:%d"
+        % ("localhost" if WEB_HOST == "127.0.0.1" else WEB_HOST, WEB_PORT))
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def handle(rel, state, dry=False):
@@ -1392,35 +2218,65 @@ def handle(rel, state, dry=False):
         log("  !! workbook pdf missing: %s" % pdf_path)
         return 0, 0          # config problem - retrying will not help
     idx = order.index(page_uuid) if page_uuid in order else 0
-    # The module is the first path segment of the workbook's source PDF - one
-    # folder per module is the convention the WORKBOOKS map documents.
     module = pdf_rel.split("/")[0]
     exam = EXAM_DATES.get(module, "not configured")
 
-    done = failed = 0
+    done = failed = deferred = 0
+    # greys first: a 'begin' on this page must release the page's own held ink
+    # in the same pass, not one poll later
+    trg.sort(key=lambda g: g["kind"] != "command")
     for g in trg:
+        # patience mode: grey 'wait' was written - hold every coloured trigger
+        # (grey still runs, or 'begin' could never be seen). Held ink counts as
+        # "failed" below so its page stays un-seen and refires after 'begin'.
+        if state.get("waiting") and g["kind"] != "command":
+            if g["hash"] not in state.setdefault("wait_seen", []):
+                state["wait_seen"].append(g["hash"])
+                log("  %s trigger on %s p.%d HELD (grey 'wait' active)"
+                    % (g["colour"], name, idx + 1))
+            deferred += 1
+            continue
         log("  %s trigger on %s p.%d (hash %s)" % (g["colour"], name, idx + 1, g["hash"]))
+        WEB.set_wb(key)
+        jid = WEB.job_start(g["kind"], key, idx + 1)
+        STOP_EVT.clear()          # each job starts with a clean stop flag
         notify("%s - %s p.%d - working..." % (g["kind"].upper(), name, idx + 1),
                "Seen your %s circle. Working on it." % g["colour"].lower(),
                priority="low", tags="eyes", dry=dry)
 
         full, crop = render(pdf_path, idx, strokes, crop=g["bbox"])
-        full_png = os.path.join(WORK_DIR, "%s_p%d_full.png" % (name, idx + 1))
+        # the trigger hash goes into the filename: resumed conversations have
+        # earlier captures in context, and a REUSED path would let the model
+        # "transcribe" the old image from memory instead of re-reading it
+        full_png = os.path.join(WORK_DIR, "%s_p%d_%s_full.png"
+                                % (name, idx + 1, g["hash"][:6]))
         full.save(full_png)
         crop_png = None
         if crop is not None:
-            crop_png = os.path.join(WORK_DIR, "%s_p%d_crop.png" % (name, idx + 1))
+            crop_png = os.path.join(WORK_DIR, "%s_p%d_%s_crop.png"
+                                    % (name, idx + 1, g["hash"][:6]))
             crop.save(crop_png)
 
         # grey = control channel; no marking, no brief, always the fast model
         if g["kind"] == "command":
+            t0 = time.time()
             try:
                 body, short = handle_command(crop_png or full_png, state, dry=dry,
-                                             page=(pdf_path, idx, g["bbox"], module))
+                                             page=(pdf_path, idx, g["bbox"], module),
+                                             doc=(doc_uuid, order, key, pdf_path,
+                                                  brief_path))
+            except Stopped:
+                log("  .. STOPPED from the dashboard - trigger ignored")
+                WEB.job_end(jid)
+                STOP_EVT.clear()
+                state["answered"].append(g["hash"])
+                done += 1
+                continue
             except Exception as e:
                 log("  !! command failed: %s" % e)
                 notify("CMD ERROR", str(e)[:400], priority="high",
                        tags="warning", dry=dry)
+                WEB.job_end(jid)
                 failed += 1
                 continue
             shots = state.pop("_shots", [])       # transient - never persisted
@@ -1429,6 +2285,9 @@ def handle(rel, state, dry=False):
             for extra in shots[1:]:
                 notify("CMD - %s" % short, "full page for context",
                        image=extra, dry=dry)
+            WEB.job_end(jid)
+            WEB.add_time("command", time.time() - t0)
+            WEB.add_response("command", key, idx + 1, short, body, shots)
             state["answered"].append(g["hash"])
             done += 1
             continue
@@ -1438,7 +2297,8 @@ def handle(rel, state, dry=False):
                "colour": g["colour"].lower(), "action": g["kind"],
                "kind": g["kind"], "image": (crop_png or full_png),
                "ptext": ptext, "excerpt": brief_excerpt(brief_path, ptext),
-               "tag": location_tag(ptext), "memrule": MEMRULE,
+               "tag": location_tag(ptext),
+               "memrule": MEMRULE + (ATTACH_RULE if g["kind"] == "explain" else ""),
                "memory": load_memory(module) or "(nothing recorded yet)"}
         ctx["header"] = HEADER.format(**ctx)
         log("  -> %s" % ctx["header"])
@@ -1452,6 +2312,7 @@ def handle(rel, state, dry=False):
                    "Fable at max effort is reading the corpus for this one - "
                    "expect several minutes.", priority="low", tags="brain", dry=dry)
         mdl, eff = (DEEP_MODEL, DEEP_EFFORT) if deep else profile(state, g["kind"])
+        t0 = time.time()
         try:
             if deep:
                 dctx = dict(ctx, module_root=os.path.join(STUDY, module))
@@ -1463,17 +2324,50 @@ def handle(rel, state, dry=False):
                                     tools=DEEP_TOOLS, timeout=DEEP_TIMEOUT))
             else:
                 reply = ask_claude(ctx, mdl, eff, state, key, dry=dry)
+        except Stopped:
+            # deliberate abort: the circle is marked answered so the prompt is
+            # ignored for good, not retried on the next poll
+            log("  .. STOPPED from the dashboard - trigger ignored")
+            WEB.job_end(jid)
+            STOP_EVT.clear()
+            state["answered"].append(g["hash"])
+            done += 1
+            continue
         except Exception as e:
             log("  !! claude failed: %s" % e)
             log("     -> leaving this page pending; it will retry each poll")
             notify("ERROR - %s p.%d" % (name, idx + 1), str(e)[:400],
                    priority="high", tags="warning", dry=dry)
+            WEB.job_end(jid)
             failed += 1
             continue
 
+        if not deep:                      # deep dives would skew the average
+            WEB.add_time(g["kind"], time.time() - t0)
         reply, note = split_memory(reply)
         if note:
             append_memory(module, note, key, idx + 1)
+        attach_reqs = []
+        if g["kind"] == "explain":
+            reply, attach_reqs = split_attach(reply)
+        if g["kind"] == "mark":
+            reply, done_drills = split_progress(reply)
+            if not done_drills:
+                # safety net: models occasionally forget the hidden PROGRESS
+                # line. A verdict of the form "D1 7/7" - whole drill, no part
+                # suffix, full marks - is just as explicit, so tick from it.
+                mv0 = re.search(r"^\s*VERDICT\s*:\s*([DE]\d{1,2})\s+"
+                                r"(\d+)\s*/\s*(\d+)", reply, re.M)
+                if (mv0 and mv0.group(2) == mv0.group(3)
+                        and int(mv0.group(2)) > 0):
+                    done_drills = [mv0.group(1).upper()]
+                    log("     progress: ticking %s from full-mark verdict"
+                        % done_drills[0])
+            if done_drills:
+                info = prog_tick(state, key, done_drills, pdf_path)
+                refresh_modules()
+                log("     progress: +%s -> %d%%"
+                    % (",".join(done_drills), info["pct"]))
         # The VERDICT line is not always first - Fable in particular narrates
         # before it. Find it anywhere; the title must be the verdict, never prose.
         mv = re.search(r"^\s*VERDICT\s*:\s*(.+)$", reply, re.M)
@@ -1488,9 +2382,21 @@ def handle(rel, state, dry=False):
         notify(title[:200], (rest.strip() or reply),
                image=(crop_png if g["kind"] == "mark" else None),
                tags=("white_check_mark" if g["kind"] == "mark" else "bulb"), dry=dry)
+        extra_imgs = []
+        for rel_a, pg_a in attach_reqs:
+            shot = render_attachment(rel_a, pg_a)
+            if shot:
+                extra_imgs.append(shot)
+                notify(("img - %s%s" % (os.path.basename(rel_a),
+                        " p.%d" % pg_a if pg_a else ""))[:180],
+                       "attached by the tutor", image=shot, dry=dry)
+        WEB.job_end(jid)
+        WEB.add_response(kind_label.lower(), key, idx + 1, verdict,
+                         (rest.strip() or reply),
+                         [crop_png or full_png] + extra_imgs)
         state["answered"].append(g["hash"])
         done += 1
-    return done, failed
+    return done, failed + deferred
 
 
 def main():
@@ -1525,6 +2431,7 @@ def main():
     # sessions; the transcript would only carry bulk.
     if state.pop("sessions", None):
         log("cleared conversation(s) from the previous launch")
+    state.pop("sess_n", None)
     state["active_wb"] = None
     state["last_page"] = None
 
@@ -1538,6 +2445,13 @@ def main():
     log("  mark %s/%s | explain %s/%s | commands %s/%s"
         % (profile(state, "mark") + profile(state, "explain")
            + (COMMAND_MODEL, COMMAND_EFFORT)))
+    WEB.progress.update(state.get("progress", {}))
+    web_profiles(state)
+    WEB.set_session_start()
+    start_web()
+    # module totals need a one-off text scan of every workbook PDF - do it off
+    # the main loop so startup stays instant
+    threading.Thread(target=refresh_modules, daemon=True).start()
     first_pass = not state["mtimes"]
     if first_pass:
         log("no previous state - baselining, will not fire on existing ink")
@@ -1548,6 +2462,7 @@ def main():
     while True:
         try:
             now = poll_mtimes()
+            WEB.set_online(True, _channel.host)
             if offline_polls >= OFFLINE_ALERT_AFTER:
                 log("tablet back online after %d failed polls" % offline_polls)
                 try:
@@ -1557,7 +2472,7 @@ def main():
                     pass
             offline_polls = 0
             # Settle gate: only act on a page once its mtime has held still for
-            # SETTLE_POLLS consecutive polls - i.e. the pen has gone quiet.
+            # SETTLE_POLLS consecutive polls - i.e. the pen has stopped.
             # Without this, a pause at a line break commits half a question and
             # we would answer it mid-sentence.
             changed = []
@@ -1574,6 +2489,8 @@ def main():
                         if s[1] >= SETTLE_POLLS:
                             changed.append(r)
                             del settling[r]
+                    elif SETTLE_POLLS <= 0:
+                        changed.append(r)      # no debounce - act immediately
                     else:
                         settling[r] = [mt, 0]  # fresh ink - start the clock
             # Oldest write first, so circling page 11 then page 12 answers in
@@ -1634,8 +2551,9 @@ def main():
         except Exception as e:
             log("poll error: %s" % e)
             _channel.close()      # force a clean reopen (wifi first, then USB)
+            WEB.set_online(False)
             offline_polls += 1
-            # tell the PHONE, once - the console is not where he is looking
+            # tell the PHONE, once - the console is not where they are looking
             if offline_polls == OFFLINE_ALERT_AFTER:
                 try:
                     notify("Tablet unreachable - asleep?",
@@ -1656,4 +2574,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
