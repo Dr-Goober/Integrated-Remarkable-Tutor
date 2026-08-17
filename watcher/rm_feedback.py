@@ -2159,7 +2159,24 @@ def notify(title, body, image=None, priority="default", tags=None, dry=False):
 # --------------------------------------------------------------------------- #
 # local dashboard (read-only mirror; the ink stays the only control surface)
 # --------------------------------------------------------------------------- #
-DASH_PATH = os.path.join(HERE, "rm_dashboard.html")
+# The page lives in its own segment (../dashboard) so it can be documented and
+# swapped independently of the watcher. Falling back to this directory keeps
+# a flat "everything in one folder" install working, which is how the watcher
+# is often dropped onto a machine.
+def _find_dashboard():
+    named = os.environ.get("RM_DASHBOARD_FILE")
+    if named:
+        return named
+    for cand in (os.path.join(os.path.dirname(HERE), "dashboard",
+                              "rm_dashboard.html"),
+                 os.path.join(HERE, "rm_dashboard.html")):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(os.path.dirname(HERE), "dashboard",
+                        "rm_dashboard.html")      # report the expected path
+
+
+DASH_PATH = _find_dashboard()
 
 # --- home-screen app assets ------------------------------------------------
 # The dashboard is plain HTTP on the LAN, so there is no service worker and no

@@ -9,7 +9,7 @@ Turn a reMarkable tablet into a handwriting-first AI study loop:
 - **Write in GREY** → commands: `model opus`, `effort high`, `deep explain`, `tutor` (blue becomes a free-form question to a full tutor), `screenshot q12` (fetches that question's image from the source exam PDF), `wait` … `begin` (hold your ink while writing a long prompt, then fire it all), `start timer 25` (a study countdown on the dashboard), `status`, `restart`, `help`
 - **Draw a GREY box** around anything, no words needed → that crop is sent back to the dashboard, rendered from the source PDF
 - **The three channels run in parallel.** Circle in blue, red and grey one after another and all three agents work at once, each on its own conversation — you do not queue behind the slowest one
-- **A local dashboard** mirrors the loop: live replies with rendered LaTeX, per-workbook and per-module progress bars, a session token/cost meter, a stop button that kills the in-flight agent, and study timers with a built-in break flow. It runs at `http://localhost:8477` on the computer, and installs to your phone's home screen as a full-screen app over Wi-Fi — see [`watcher/SETUP.md`](watcher/SETUP.md) part 5
+- **A local dashboard** mirrors the loop: live replies with rendered LaTeX, per-workbook and per-module progress bars, a session token/cost meter, a stop button that kills the in-flight agent, and study timers with a built-in break flow. It runs at `http://localhost:8477` on the computer, and installs to your phone's home screen as a full-screen app over Wi-Fi — see [`dashboard/SETUP.md`](dashboard/SETUP.md)
 - You keep writing on paper-like e-ink the whole time. No app switching, no typing, no chat window.
 
 Built during a real two-exam sprint (and battle-tested on it). Everything here is the generalised version of that setup.
@@ -23,7 +23,7 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
      └── you erase circles          └──── ntfy push (optional) ────> phone
 ```
 
-## Repo layout — two segments
+## Repo layout — three segments
 
 **[`watcher/`](watcher/)** — the live ink loop. Start here.
 
@@ -31,11 +31,17 @@ Built during a real two-exam sprint (and battle-tested on it). Everything here i
 |---|---|
 | `SETUP.md` | One-time setup: tablet SSH, keys, phone notifications, Python. |
 | `rm_feedback.py` | The watcher — the whole live loop in one file. Read its docstring first. |
-| `rm_dashboard.html` | The local dashboard the watcher serves at `http://localhost:8477`: live feed, progress tracking, session stats, stop control, timers. |
 | `START-WATCHER.bat` / `.sh` | Double-click (Windows) / `sh` (Linux, macOS) launchers; both make grey `restart` work cleanly. |
 | `build_question_map.py` | Builds the question-location table the grey `screenshot qN` command fetches from. |
 | `capture.ps1` | Manual fallback: screenshots the reMarkable desktop app (works even when occluded) for ad-hoc "mark my screen" requests. |
 | `skills/remarkable-tutor` | The marking/tutoring protocol as a Claude Code skill. |
+
+**[`dashboard/`](dashboard/)** — the page the watcher serves. Nothing to install; it is up as soon as the watcher is.
+
+| File | What it is |
+|---|---|
+| `SETUP.md` | Opening it on the computer and on a phone: LAN exposure, firewall rules, installing it to a home screen, and the two limits (LAN-only, no authentication). |
+| `rm_dashboard.html` | The whole page — one self-contained file, no build step. Live feed with rendered LaTeX, per-channel activity, progress bars, session meter, stop control and study timers. |
 
 **[`workbook-pipeline/`](workbook-pipeline/)** — the content factory that makes the marking worth anything: raw module PDFs → study corpus → write-on workbooks → marking notes.
 
@@ -64,7 +70,7 @@ Skills are standard Claude Code skills — drop any of them into `.claude/skills
 3. Edit the `WORKBOOKS` map (and `EXAM_DATES`) in `rm_feedback.py`: tablet document name → (source PDF, tutor brief). The shipped map is an example — replace it.
 4. Put the PDFs you study from on the tablet with the **same names** as in the map.
 5. Double-click `watcher/START-WATCHER.bat` (Windows) or run `sh watcher/START-WATCHER.sh` (Linux/macOS). Write, circle, keep working.
-6. Open `http://localhost:8477` on the watcher machine for the live dashboard.
+6. Open `http://localhost:8477` on the watcher machine for the live dashboard. To reach it from your phone as well, see [`dashboard/SETUP.md`](dashboard/SETUP.md).
 
 ## The four hard-won technical facts (so you don't rediscover them)
 
